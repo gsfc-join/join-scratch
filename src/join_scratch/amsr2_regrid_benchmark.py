@@ -31,17 +31,19 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
-import xesmf
 
 from join_scratch.amsr2_regrid import (
     AMSR2,
     AMSR2_GLOB,
     DATA_RAW,
     LIS_PATH,
+    WEIGHTS_PATH,
     build_amsr2_swath_definition,
     build_lis_area_definition,
+    compute_weights,
     load_amsr2,
     load_lis_grid,
+    load_regridder,
     regrid_bilinear_pyresample,
     regrid_kd_gauss,
     regrid_kd_nearest,
@@ -103,15 +105,12 @@ def bench_xesmf(
     rss_before = _rss_mib()
     t0 = time.perf_counter()
 
-    regridder = xesmf.Regridder(
-        source_grid,
-        lis_grid,
-        method="bilinear",
-        periodic=True,
-    )
+    compute_weights(source_grid, lis_grid, WEIGHTS_PATH)
 
     elapsed = time.perf_counter() - t0
     rss_delta = _rss_mib() - rss_before
+
+    regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
     nnz = int(regridder.weights.data.nnz)
 
     log.info("xesmf_bilinear: %.2f s | RSS +%.1f MiB | nnz=%d", elapsed, rss_delta, nnz)

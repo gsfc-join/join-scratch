@@ -25,9 +25,9 @@ from join_scratch.amsr2_regrid import (
     WEIGHTS_PATH,
     build_amsr2_swath_definition,
     build_lis_area_definition,
-    get_regridder,
     load_amsr2,
     load_lis_grid,
+    load_regridder,
     regrid_bilinear_pyresample,
     regrid_kd_gauss,
     regrid_kd_nearest,
@@ -123,7 +123,8 @@ def main() -> None:
 
     # --- Compute all regridded outputs ---
     log.info("Regridding with xESMF …")
-    xesmf_regridder = get_regridder(amsr2_ds[["lat", "lon"]], lis_grid, WEIGHTS_PATH)
+    source_grid = amsr2_ds[["lat", "lon"]]
+    xesmf_regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
     xesmf_out = xesmf_regridder(amsr2_ds)
     # shape: (phony_dim_2=2, north_south=1750, east_west=2100)
     # xesmf result has dims matching the LIS grid; extract as (NY, NX, 2)

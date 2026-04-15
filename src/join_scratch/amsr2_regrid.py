@@ -66,10 +66,22 @@ AMSR2 = Amsr2Constants()
 
 
 def load_lis_grid(path: Path) -> xr.Dataset:
-    """Load the LIS input file and return a dataset with lat/lon/lat_b/lon_b."""
+    """Load the LIS input file and return a dataset with lat/lon/lat_b/lon_b.
+
+    The LIS file stores rows south-first (row 0 = southernmost).  This
+    function flips the north_south (and north_south_b) dimensions so that
+    row 0 = northernmost, matching the convention used by pyresample
+    AreaDefinition and producing consistent output across all regrid methods.
+    """
     log.info("Loading LIS grid from %s", path)
     ds = xr.open_dataset(path, engine="h5netcdf")
-    return ds[["lat", "lon", "lat_b", "lon_b"]]
+    ds = ds[["lat", "lon", "lat_b", "lon_b"]]
+    # Flip to north-first row ordering
+    ds = ds.isel(
+        north_south=slice(None, None, -1),
+        north_south_b=slice(None, None, -1),
+    )
+    return ds
 
 
 def build_lis_area_definition(path: Path) -> AreaDefinition:
@@ -166,65 +178,53 @@ def load_amsr2(path: Path) -> xr.Dataset:
 # ---------------------------------------------------------------------------
 
 
-def _weights_are_valid(weights_path: Path, n_in: int, n_out: int) -> bool:
-    """Return True if the cached weight file matches the expected grid sizes."""
-    try:
-        w = xr.open_dataset(weights_path)
-        max_col = int(w["col"].max())
-        max_row = int(w["row"].max())
-        return max_col <= n_in and max_row <= n_out
-    except Exception:
-        return False
-
-
-def get_regridder(
+def compute_weights(
     source_grid: xr.Dataset,
     target_grid: xr.Dataset,
     weights_path: Path,
-) -> xesmf.Regridder:
-    """Build or load an xESMF bilinear regridder.
+    method: str = "bilinear",
+) -> Path:
+    """Compute xESMF regridding weights and save them to *weights_path*.
 
-    If *weights_path* already exists and is consistent with the source/target
-    grid sizes, the weights are reused; otherwise they are recomputed and saved.
+    Always recomputes — never reuses an existing file.  Returns *weights_path*.
     """
-    if weights_path.exists():
-        # Infer expected sizes from the grids
-        from xesmf.frontend import _get_lon_lat
-
-        lon_in, lat_in = _get_lon_lat(source_grid)
-        lon_out, lat_out = _get_lon_lat(target_grid)
-        n_in = int(np.asarray(lat_in).size)
-        n_out = int(np.asarray(lat_out).size)
-        if _weights_are_valid(weights_path, n_in, n_out):
-            log.info("Reusing existing xESMF weights from %s", weights_path)
-            return xesmf.Regridder(
-                source_grid,
-                target_grid,
-                method="bilinear",
-                periodic=True,
-                weights=str(weights_path),
-                reuse_weights=True,
-            )
-        log.warning(
-            "Cached weights at %s are incompatible with current grids "
-            "(n_in=%d, n_out=%d); recomputing.",
-            weights_path,
-            n_in,
-            n_out,
-        )
-        weights_path.unlink()
-
-    log.info("Computing xESMF bilinear weights …")
+    log.info("Computing xESMF %s weights …", method)
     regridder = xesmf.Regridder(
         source_grid,
         target_grid,
-        method="bilinear",
+        method=method,
         periodic=True,
     )
     weights_path.parent.mkdir(parents=True, exist_ok=True)
     regridder.to_netcdf(str(weights_path))
     log.info("xESMF weights saved to %s", weights_path)
-    return regridder
+    return weights_path
+
+
+def load_regridder(
+    source_grid: xr.Dataset,
+    target_grid: xr.Dataset,
+    weights_path: Path,
+    method: str = "bilinear",
+) -> xesmf.Regridder:
+    """Load a pre-computed xESMF regridder from *weights_path*.
+
+    Raises FileNotFoundError if the weights file does not exist — call
+    compute_weights() first.
+    """
+    if not weights_path.exists():
+        raise FileNotFoundError(
+            f"Weights file not found: {weights_path}. Run compute_weights() first."
+        )
+    log.info("Loading xESMF weights from %s", weights_path)
+    return xesmf.Regridder(
+        source_grid,
+        target_grid,
+        method=method,
+        periodic=True,
+        weights=str(weights_path),
+        reuse_weights=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +311,7 @@ def regrid_file(
     regridder: xesmf.Regridder,
     out_dir: Path,
 ) -> Path:
-    """Regrid a single AMSR2 file with xESMF and write the result to *out_dir*.
+    """Apply a pre-loaded xESMF regridder to one AMSR2 file and write NetCDF.
 
     Returns the path of the written output file.
     """
@@ -344,11 +344,12 @@ def main() -> None:
 
     lis_grid = load_lis_grid(LIS_PATH)
 
-    # Build/load the regridder using the first file's grid (all files share
-    # the same equirectangular 0.1° grid, so one weight set covers all).
+    # All AMSR2 files share the same 0.1° equirectangular grid, so one set of
+    # weights covers all files. Compute them from the first file's grid.
     source_ds = load_amsr2(amsr2_files[0])
     source_grid = source_ds[["lat", "lon"]]
-    regridder = get_regridder(source_grid, lis_grid, WEIGHTS_PATH)
+    compute_weights(source_grid, lis_grid, WEIGHTS_PATH)
+    regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
 
     for amsr2_path in amsr2_files:
         out_path = regrid_file(amsr2_path, regridder, DATA_OUT)
