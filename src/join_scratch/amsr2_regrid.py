@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Regrid local AMSR2 snow depth files to the LIS input grid using xESMF."""
+"""Regrid local AMSR2 snow depth files to the LIS input grid."""
 
 import logging
 from dataclasses import dataclass, field
@@ -9,9 +9,10 @@ import numpy as np
 import pyproj
 import xarray as xr
 import xesmf
-from pyresample.bilinear import XArrayBilinearResampler
 from pyresample.geometry import AreaDefinition, SwathDefinition
-from pyresample import kd_tree
+from satpy.resample.bucket import BucketAvg
+from satpy.resample.ewa import DaskEWAResampler
+from satpy.resample.kdtree import BilinearResampler, KDTreeResampler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +31,10 @@ DATA_OUT = ROOT / "_data" / "amsr2"
 LIS_PATH = DATA_RAW / "lis_input_NMP_1000m_missouri.nc"
 AMSR2_GLOB = "JOIN/AMSR2/**/*.h5"
 WEIGHTS_PATH = DATA_OUT / "amsr2-lis-weights.nc"
+# Satpy caches neighbour-lookup tables as zarr files keyed by a hash of the
+# source/target geometry.  The same directory is shared across all satpy
+# methods that support caching (nearest, bilinear, ewa).
+SATPY_CACHE = DATA_OUT / "satpy-cache"
 
 
 # ---------------------------------------------------------------------------
@@ -45,16 +50,15 @@ class Amsr2Constants:
     with no explicit coordinate variables in the HDF5 file; all values here are
     derived from the product specification.
 
-    Pyresample radius of influence is set slightly larger than the AMSR2 pixel
-    diagonal (~11 km at mid-latitudes) to avoid gaps in the target grid.
+    radius_of_influence is set slightly larger than the AMSR2 pixel diagonal
+    (~11 km at mid-latitudes) to avoid gaps in the target grid.
     """
 
     n_lat: int = 1800
     n_lon: int = 3600
     lat: np.ndarray = field(default_factory=lambda: np.linspace(89.95, -89.95, 1800))
     lon: np.ndarray = field(default_factory=lambda: np.linspace(-179.95, 179.95, 3600))
-    kd_radius_m: float = 15_000.0
-    gauss_sigma_m: float = 10_000.0
+    radius_of_influence: float = 15_000.0
 
 
 AMSR2 = Amsr2Constants()
@@ -145,9 +149,13 @@ def build_amsr2_swath_definition(ds: xr.Dataset) -> SwathDefinition:
 
     The dataset must already have 1-D 'lat' and 'lon' coordinates assigned;
     they are broadcast to 2-D meshgrids as required by pyresample.
+    Coordinates are kept as xarray DataArrays so that satpy resamplers
+    (which require .dims on the geometry arrays) work correctly.
     """
-    lons_2d, lats_2d = np.meshgrid(ds["lon"].values, ds["lat"].values)
-    return SwathDefinition(lons=lons_2d, lats=lats_2d)
+    lons_np, lats_np = np.meshgrid(ds["lon"].values, ds["lat"].values)
+    lons_da = xr.DataArray(lons_np, dims=["y", "x"])
+    lats_da = xr.DataArray(lats_np, dims=["y", "x"])
+    return SwathDefinition(lons=lons_da, lats=lats_da)
 
 
 # ---------------------------------------------------------------------------
@@ -228,76 +236,130 @@ def load_regridder(
 
 
 # ---------------------------------------------------------------------------
-# pyresample regridding
+# satpy regridding
 # ---------------------------------------------------------------------------
+# Satpy's KDTreeResampler, BilinearResampler, and DaskEWAResampler all support
+# a cache_dir argument.  On the first call they compute the neighbour-lookup
+# tables and write them as zarr files to SATPY_CACHE (named by a hash of the
+# source/target geometry).  Subsequent calls with the same geometry load from
+# disk instead of recomputing — analogous to xESMF's weights file.
+#
+# BucketAvg does not support caching: it is a simple scatter-add binning
+# operation with no precomputed index structures.
+#
+# The resampler instance is created once per call and reused across the inner
+# channel dimension so that the in-memory index cache is also exploited.
 
 
-def regrid_kd_nearest(
-    ds: xr.Dataset,
-    source_def: SwathDefinition,
-    target_def: AreaDefinition,
-) -> np.ndarray:
-    """Regrid using pyresample kd_tree nearest-neighbour resampling.
-
-    Returns a float32 array of shape (NY, NX, n_inner).
-    """
+def _iter_inner(ds: xr.Dataset) -> list[xr.DataArray]:
+    """Return the inner-channel slices of 'Geophysical Data' as DataArrays."""
     data = ds["Geophysical Data"].values  # (nlat, nlon, n_inner)
-    slices = [
-        kd_tree.resample_nearest(
-            source_def,
-            data[:, :, i],
-            target_def,
-            radius_of_influence=AMSR2.kd_radius_m,
-            fill_value=np.nan,
-        )
+    return [
+        xr.DataArray(data[:, :, i].astype(np.float32), dims=["y", "x"])
         for i in range(data.shape[2])
+    ]
+
+
+def regrid_nearest(
+    ds: xr.Dataset,
+    source_def: SwathDefinition,
+    target_def: AreaDefinition,
+    cache_dir: Path = SATPY_CACHE,
+) -> np.ndarray:
+    """Regrid using satpy KDTreeResampler (nearest-neighbour).
+
+    Neighbour indices are cached to *cache_dir* as a zarr file on first run
+    and reloaded automatically on subsequent runs.
+
+    Note: we call precompute() + compute() directly rather than resample()
+    to avoid satpy's automatic NaN-mask injection for SwathDefinitions, which
+    would conflict with cache_dir and silently disable caching.
+    Returns a float32 array of shape (NY, NX, n_inner).
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    resampler = KDTreeResampler(source_def, target_def)
+    resampler.precompute(
+        radius_of_influence=AMSR2.radius_of_influence,
+        cache_dir=str(cache_dir),
+    )
+    slices = [
+        np.asarray(resampler.compute(da, fill_value=np.nan)) for da in _iter_inner(ds)
     ]
     return np.stack(slices, axis=-1)
 
 
-def regrid_kd_gauss(
+def regrid_bilinear(
     ds: xr.Dataset,
     source_def: SwathDefinition,
     target_def: AreaDefinition,
+    cache_dir: Path = SATPY_CACHE,
 ) -> np.ndarray:
-    """Regrid using pyresample kd_tree Gaussian-weighted resampling.
+    """Regrid using satpy BilinearResampler.
 
+    Bilinear coefficients are cached to *cache_dir* as a zarr file on first
+    run and reloaded automatically on subsequent runs.
     Returns a float32 array of shape (NY, NX, n_inner).
     """
-    data = ds["Geophysical Data"].values
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    resampler = BilinearResampler(source_def, target_def)
     slices = [
-        kd_tree.resample_gauss(
-            source_def,
-            data[:, :, i],
-            target_def,
-            radius_of_influence=AMSR2.kd_radius_m,
-            sigmas=AMSR2.gauss_sigma_m,
-            fill_value=np.nan,
+        np.asarray(
+            resampler.resample(
+                da,
+                radius_of_influence=AMSR2.radius_of_influence,
+                fill_value=np.nan,
+                cache_dir=str(cache_dir),
+            )
         )
-        for i in range(data.shape[2])
+        for da in _iter_inner(ds)
     ]
     return np.stack(slices, axis=-1)
 
 
-def regrid_bilinear_pyresample(
+def regrid_ewa(
     ds: xr.Dataset,
     source_def: SwathDefinition,
     target_def: AreaDefinition,
 ) -> np.ndarray:
-    """Regrid using pyresample XArrayBilinearResampler.
+    """Regrid using satpy DaskEWAResampler (Elliptical Weighted Averaging).
 
+    EWA is designed for scan-line satellite data but works for any
+    SwathDefinition source; rows_per_scan=0 disables scan-line grouping so
+    the full swath is treated as one pass.
+
+    Note: DaskEWAResampler does not support cache_dir — it has no precomputed
+    index structures to persist between runs.
     Returns a float32 array of shape (NY, NX, n_inner).
     """
-    data = ds["Geophysical Data"].values
-    slices = []
-    for i in range(data.shape[2]):
-        da = xr.DataArray(data[:, :, i].astype(np.float32), dims=["y", "x"])
-        resampler = XArrayBilinearResampler(
-            source_def,
-            target_def,
-            radius_of_influence=AMSR2.kd_radius_m,
+    resampler = DaskEWAResampler(source_def, target_def)
+    slices = [
+        np.asarray(
+            resampler.resample(
+                da,
+                rows_per_scan=0,
+                fill_value=np.nan,
+            )
         )
-        slices.append(resampler.resample(da).values)
+        for da in _iter_inner(ds)
+    ]
+    return np.stack(slices, axis=-1)
+
+
+def regrid_bucket_avg(
+    ds: xr.Dataset,
+    source_def: SwathDefinition,
+    target_def: AreaDefinition,
+) -> np.ndarray:
+    """Regrid using satpy BucketAvg (average of all source pixels per target cell).
+
+    BucketAvg does not support caching — it is a simple scatter-add binning
+    operation with no precomputed index structures to store.
+    Returns a float32 array of shape (NY, NX, n_inner).
+    """
+    resampler = BucketAvg(source_def, target_def)
+    slices = [
+        np.asarray(resampler.resample(da, fill_value=np.nan)) for da in _iter_inner(ds)
+    ]
     return np.stack(slices, axis=-1)
 
 

@@ -5,7 +5,7 @@ Produces a single PNG in _figures/ with:
   - Top row: original AMSR2 data (global, lat/lon) with LIS domain boundary
     overlaid as a line, one panel per inner dimension slice
   - Subsequent rows: regridded data on the LIS grid for each method
-    (xesmf_bilinear, kd_nearest, kd_gauss, pr_bilinear)
+    (xesmf_bilinear, nearest, bilinear, ewa, bucket_avg)
 
 The inner dimension of size 2 (two retrieval channels) is shown side-by-side
 in each row.
@@ -15,7 +15,6 @@ import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
 import numpy as np
 
 from join_scratch.amsr2_regrid import (
@@ -28,9 +27,10 @@ from join_scratch.amsr2_regrid import (
     load_amsr2,
     load_lis_grid,
     load_regridder,
-    regrid_bilinear_pyresample,
-    regrid_kd_gauss,
-    regrid_kd_nearest,
+    regrid_bilinear,
+    regrid_bucket_avg,
+    regrid_ewa,
+    regrid_nearest,
 )
 
 logging.basicConfig(
@@ -43,21 +43,22 @@ log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 FIGURES_DIR = ROOT / "_figures"
 
-# Number of inner dimension slices (retrieval channels)
 N_INNER = 2
 INNER_LABELS = ["Channel 0", "Channel 1"]
 
 METHODS = [
     "xesmf_bilinear",
-    "kd_nearest",
-    "kd_gauss",
-    "pr_bilinear",
+    "nearest",
+    "bilinear",
+    "ewa",
+    "bucket_avg",
 ]
 METHOD_LABELS = {
     "xesmf_bilinear": "xESMF bilinear",
-    "kd_nearest": "pyresample kd_tree nearest",
-    "kd_gauss": "pyresample kd_tree Gauss",
-    "pr_bilinear": "pyresample bilinear",
+    "nearest": "satpy nearest",
+    "bilinear": "satpy bilinear",
+    "ewa": "satpy EWA",
+    "bucket_avg": "satpy bucket avg",
 }
 
 
@@ -69,37 +70,13 @@ METHOD_LABELS = {
 def _lis_boundary_lonlat(lis_area) -> tuple[np.ndarray, np.ndarray]:
     """Return (lons, lats) arrays tracing the LIS domain boundary (closed loop)."""
     lons, lats = lis_area.get_lonlats()
-    ny, nx = lons.shape
-    # top edge (left to right), right edge (top to bottom),
-    # bottom edge (right to left), left edge (bottom to top)
     b_lons = np.concatenate(
-        [
-            lons[0, :],
-            lons[:, -1],
-            lons[-1, ::-1],
-            lons[::-1, 0],
-            [lons[0, 0]],  # close the loop
-        ]
+        [lons[0, :], lons[:, -1], lons[-1, ::-1], lons[::-1, 0], [lons[0, 0]]]
     )
     b_lats = np.concatenate(
-        [
-            lats[0, :],
-            lats[:, -1],
-            lats[-1, ::-1],
-            lats[::-1, 0],
-            [lats[0, 0]],
-        ]
+        [lats[0, :], lats[:, -1], lats[-1, ::-1], lats[::-1, 0], [lats[0, 0]]]
     )
     return b_lons, b_lats
-
-
-def _pcolormesh_kwargs(data: np.ndarray) -> dict:
-    """Compute robust vmin/vmax from the 2nd–98th percentile of valid data."""
-    valid = data[np.isfinite(data)]
-    if valid.size == 0:
-        return {}
-    vmin, vmax = np.nanpercentile(valid, [2, 98])
-    return {"vmin": vmin, "vmax": vmax, "cmap": "Blues"}
 
 
 # ---------------------------------------------------------------------------
@@ -126,39 +103,37 @@ def main() -> None:
     source_grid = amsr2_ds[["lat", "lon"]]
     xesmf_regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
     xesmf_out = xesmf_regridder(amsr2_ds)
-    # shape: (phony_dim_2=2, north_south=1750, east_west=2100)
-    # xesmf result has dims matching the LIS grid; extract as (NY, NX, 2)
     geo_data_xesmf = xesmf_out["Geophysical Data"].values
-    # xesmf output may be (2, 1750, 2100) – check and transpose if needed
     if geo_data_xesmf.shape[0] == N_INNER:
         geo_data_xesmf = np.moveaxis(geo_data_xesmf, 0, -1)
 
-    log.info("Regridding with kd_nearest …")
-    kd_nearest_out = regrid_kd_nearest(amsr2_ds, amsr2_swath, lis_area)
+    log.info("Regridding with nearest …")
+    nearest_out = regrid_nearest(amsr2_ds, amsr2_swath, lis_area)
 
-    log.info("Regridding with kd_gauss …")
-    kd_gauss_out = regrid_kd_gauss(amsr2_ds, amsr2_swath, lis_area)
+    log.info("Regridding with bilinear …")
+    bilinear_out = regrid_bilinear(amsr2_ds, amsr2_swath, lis_area)
 
-    log.info("Regridding with pr_bilinear …")
-    pr_bilinear_out = regrid_bilinear_pyresample(amsr2_ds, amsr2_swath, lis_area)
+    log.info("Regridding with EWA …")
+    ewa_out = regrid_ewa(amsr2_ds, amsr2_swath, lis_area)
+
+    log.info("Regridding with bucket_avg …")
+    bucket_out = regrid_bucket_avg(amsr2_ds, amsr2_swath, lis_area)
 
     regridded = {
         "xesmf_bilinear": geo_data_xesmf,
-        "kd_nearest": kd_nearest_out,
-        "kd_gauss": kd_gauss_out,
-        "pr_bilinear": pr_bilinear_out,
+        "nearest": nearest_out,
+        "bilinear": bilinear_out,
+        "ewa": ewa_out,
+        "bucket_avg": bucket_out,
     }
 
     # --- Build boundary for overlay ---
-    log.info("Building LIS boundary …")
     b_lons, b_lats = _lis_boundary_lonlat(lis_area)
 
-    # --- Raw AMSR2 data ---
+    # --- Raw AMSR2 data subsetted to LIS region + padding ---
     raw_data = amsr2_ds["Geophysical Data"].values  # (1800, 3600, 2)
     raw_lons = amsr2_ds["lon"].values
     raw_lats = amsr2_ds["lat"].values
-
-    # --- Subset raw data to a region slightly larger than LIS for clarity ---
     lat_pad, lon_pad = 3.0, 5.0
     lat_min = float(lis_lats.min()) - lat_pad
     lat_max = float(lis_lats.max()) + lat_pad
@@ -170,22 +145,21 @@ def main() -> None:
     raw_lons_sub = raw_lons[lon_mask]
     raw_lats_sub = raw_lats[lat_mask]
 
-    # --- Layout: rows = [original] + methods, cols = inner channels ---
-    n_rows = 1 + len(METHODS)
-    n_cols = N_INNER
-    fig, axes = plt.subplots(
-        n_rows,
-        n_cols,
-        figsize=(7 * n_cols, 5 * n_rows),
-        constrained_layout=True,
-    )
-
-    # Shared colour scale across all panels (use the original data range)
+    # Shared colour scale across all panels
     all_valid = raw_sub[np.isfinite(raw_sub)]
     vmin, vmax = np.nanpercentile(all_valid, [2, 98]) if all_valid.size > 0 else (0, 1)
     pkw = {"vmin": vmin, "vmax": vmax, "cmap": "Blues"}
 
-    # Row 0: original AMSR2 + LIS boundary overlay
+    # --- Layout ---
+    n_rows = 1 + len(METHODS)
+    fig, axes = plt.subplots(
+        n_rows,
+        N_INNER,
+        figsize=(7 * N_INNER, 5 * n_rows),
+        constrained_layout=True,
+    )
+
+    # Row 0: original AMSR2
     for ch in range(N_INNER):
         ax = axes[0, ch]
         pcm = ax.pcolormesh(raw_lons_sub, raw_lats_sub, raw_sub[:, :, ch], **pkw)

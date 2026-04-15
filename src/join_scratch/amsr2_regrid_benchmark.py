@@ -1,21 +1,17 @@
 #!/usr/bin/env python
 """Benchmark regridding approaches for AMSR2 -> LIS grid.
 
-Compares weight-generation (or equivalent setup) time and memory for:
-  - xesmf_bilinear:  xESMF bilinear (global AMSR2 source grid)
-  - kd_nearest:      pyresample kd_tree nearest-neighbour
-  - kd_gauss:        pyresample kd_tree Gaussian-weighted
-  - pr_bilinear:     pyresample XArrayBilinearResampler
+Compares wall-clock time and RSS memory for:
+  - xesmf_bilinear : xESMF bilinear (weight generation; weights cached to file)
+  - nearest        : satpy KDTreeResampler nearest-neighbour
+  - bilinear       : satpy BilinearResampler
+  - ewa            : satpy DaskEWAResampler (Elliptical Weighted Averaging)
+  - bucket_avg     : satpy BucketAvg (no caching supported)
 
-Notes on excluded algorithms:
-  - EWA (Elliptical Weighted Averaging): requires SwathDefinition as source
-    (hard isinstance check in DaskEWAResampler.__init__) and AreaDefinition
-    as target. Our source is a regular lat/lon grid (not a scan-based swath)
-    and our target is an AreaDefinition, so only one constraint would be met.
-    EWA is designed for scan-line satellite swath data and is not appropriate
-    here.
-  - pyresample bilinear with SwathDefinition target: requires AreaDefinition
-    as target (needs get_proj_coords()); we use AreaDefinition, so this works.
+For the two satpy methods that support caching (nearest, bilinear),
+timing is reported for both the cold run (cache written) and a warm run
+(cache reloaded from disk), to quantify the caching benefit.
+EWA and BucketAvg do not support caching and are timed once.
 
 Measures wall-clock time and peak RSS memory for each strategy and writes
 plain-text reports to _reports/ in the project root.
@@ -24,9 +20,10 @@ plain-text reports to _reports/ in the project root.
 import gc
 import logging
 import resource
+import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +34,7 @@ from join_scratch.amsr2_regrid import (
     AMSR2_GLOB,
     DATA_RAW,
     LIS_PATH,
+    SATPY_CACHE,
     WEIGHTS_PATH,
     build_amsr2_swath_definition,
     build_lis_area_definition,
@@ -44,9 +42,10 @@ from join_scratch.amsr2_regrid import (
     load_amsr2,
     load_lis_grid,
     load_regridder,
-    regrid_bilinear_pyresample,
-    regrid_kd_gauss,
-    regrid_kd_nearest,
+    regrid_bilinear,
+    regrid_bucket_avg,
+    regrid_ewa,
+    regrid_nearest,
 )
 
 logging.basicConfig(
@@ -92,6 +91,15 @@ class BenchmarkResult:
 # ---------------------------------------------------------------------------
 
 
+def _time_call(fn, *args, **kwargs) -> tuple[float, float]:
+    """Run fn(*args, **kwargs) and return (elapsed_s, rss_delta_mib)."""
+    gc.collect()
+    rss_before = _rss_mib()
+    t0 = time.perf_counter()
+    fn(*args, **kwargs)
+    return time.perf_counter() - t0, _rss_mib() - rss_before
+
+
 def bench_xesmf(
     amsr2_ds: xr.Dataset,
     lis_grid: xr.Dataset,
@@ -101,14 +109,9 @@ def bench_xesmf(
     ny, nx = int(source_grid.sizes["lat"]), int(source_grid.sizes["lon"])
     log.info("Benchmarking xesmf_bilinear (source %d x %d) …", ny, nx)
 
-    gc.collect()
-    rss_before = _rss_mib()
-    t0 = time.perf_counter()
-
-    compute_weights(source_grid, lis_grid, WEIGHTS_PATH)
-
-    elapsed = time.perf_counter() - t0
-    rss_delta = _rss_mib() - rss_before
+    elapsed, rss_delta = _time_call(
+        compute_weights, source_grid, lis_grid, WEIGHTS_PATH
+    )
 
     regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
     nnz = int(regridder.weights.data.nnz)
@@ -123,87 +126,75 @@ def bench_xesmf(
     )
 
 
-def bench_kd_nearest(
+def _bench_satpy(
+    label: str,
+    fn,
     amsr2_ds: xr.Dataset,
     source_def,
     target_def,
+    cache_dir: Path,
+    has_cache: bool,
+    extra_notes: str = "",
 ) -> BenchmarkResult:
-    """pyresample kd_tree nearest-neighbour: measure full resample time + memory."""
+    """Generic runner for a satpy regrid function, cold or warm cache."""
     ny, nx = int(amsr2_ds.sizes["lat"]), int(amsr2_ds.sizes["lon"])
-    log.info("Benchmarking kd_nearest (source %d x %d) …", ny, nx)
+    cache_tag = "warm" if has_cache else "cold"
+    log.info("Benchmarking %s (%s cache, source %d x %d) …", label, cache_tag, ny, nx)
 
-    gc.collect()
-    rss_before = _rss_mib()
-    t0 = time.perf_counter()
+    elapsed, rss_delta = _time_call(fn, amsr2_ds, source_def, target_def, cache_dir)
 
-    regrid_kd_nearest(amsr2_ds, source_def, target_def)
-
-    elapsed = time.perf_counter() - t0
-    rss_delta = _rss_mib() - rss_before
-
-    log.info("kd_nearest: %.2f s | RSS +%.1f MiB", elapsed, rss_delta)
+    log.info("%s (%s): %.2f s | RSS +%.1f MiB", label, cache_tag, elapsed, rss_delta)
+    notes = f"{cache_tag} cache"
+    if extra_notes:
+        notes += f"; {extra_notes}"
     return BenchmarkResult(
-        label="kd_nearest",
+        label=f"{label} ({cache_tag})",
         source_shape=(ny, nx),
         elapsed_s=elapsed,
         rss_delta_mib=rss_delta,
-        notes=f"radius={AMSR2.kd_radius_m / 1000:.0f} km",
+        notes=notes,
     )
 
 
-def bench_kd_gauss(
+def bench_ewa(
     amsr2_ds: xr.Dataset,
     source_def,
     target_def,
 ) -> BenchmarkResult:
-    """pyresample kd_tree Gaussian: measure full resample time + memory."""
+    """satpy DaskEWAResampler: no cache supported, single timing."""
     ny, nx = int(amsr2_ds.sizes["lat"]), int(amsr2_ds.sizes["lon"])
-    log.info("Benchmarking kd_gauss (source %d x %d) …", ny, nx)
+    log.info("Benchmarking ewa (source %d x %d) …", ny, nx)
 
-    gc.collect()
-    rss_before = _rss_mib()
-    t0 = time.perf_counter()
+    elapsed, rss_delta = _time_call(regrid_ewa, amsr2_ds, source_def, target_def)
 
-    regrid_kd_gauss(amsr2_ds, source_def, target_def)
-
-    elapsed = time.perf_counter() - t0
-    rss_delta = _rss_mib() - rss_before
-
-    log.info("kd_gauss: %.2f s | RSS +%.1f MiB", elapsed, rss_delta)
+    log.info("ewa: %.2f s | RSS +%.1f MiB", elapsed, rss_delta)
     return BenchmarkResult(
-        label="kd_gauss",
+        label="ewa",
         source_shape=(ny, nx),
         elapsed_s=elapsed,
         rss_delta_mib=rss_delta,
-        notes=f"radius={AMSR2.kd_radius_m / 1000:.0f} km sigma={AMSR2.gauss_sigma_m / 1000:.0f} km",
+        notes="no caching",
     )
 
 
-def bench_pr_bilinear(
+def bench_bucket_avg(
     amsr2_ds: xr.Dataset,
     source_def,
     target_def,
 ) -> BenchmarkResult:
-    """pyresample XArrayBilinearResampler: measure full resample time + memory."""
+    """satpy BucketAvg: no cache supported, single timing."""
     ny, nx = int(amsr2_ds.sizes["lat"]), int(amsr2_ds.sizes["lon"])
-    log.info("Benchmarking pr_bilinear (source %d x %d) …", ny, nx)
+    log.info("Benchmarking bucket_avg (source %d x %d) …", ny, nx)
 
-    gc.collect()
-    rss_before = _rss_mib()
-    t0 = time.perf_counter()
+    elapsed, rss_delta = _time_call(regrid_bucket_avg, amsr2_ds, source_def, target_def)
 
-    regrid_bilinear_pyresample(amsr2_ds, source_def, target_def)
-
-    elapsed = time.perf_counter() - t0
-    rss_delta = _rss_mib() - rss_before
-
-    log.info("pr_bilinear: %.2f s | RSS +%.1f MiB", elapsed, rss_delta)
+    log.info("bucket_avg: %.2f s | RSS +%.1f MiB", elapsed, rss_delta)
     return BenchmarkResult(
-        label="pr_bilinear",
+        label="bucket_avg",
         source_shape=(ny, nx),
         elapsed_s=elapsed,
         rss_delta_mib=rss_delta,
-        notes=f"radius={AMSR2.kd_radius_m / 1000:.0f} km",
+        notes="no caching",
     )
 
 
@@ -213,7 +204,7 @@ def bench_pr_bilinear(
 
 
 def render_report(results: list[BenchmarkResult]) -> str:
-    col_w = (20, 18, 10, 16, 40)
+    col_w = (28, 18, 10, 16, 40)
     header = (
         f"{'Method':<{col_w[0]}} {'Source shape':<{col_w[1]}} "
         f"{'Time (s)':>{col_w[2]}} {'RSS delta (MiB)':>{col_w[3]}} "
@@ -225,14 +216,20 @@ def render_report(results: list[BenchmarkResult]) -> str:
         "AMSR2 Regridding Benchmark",
         "==========================",
         "",
-        "Algorithms compared:",
-        "  xesmf_bilinear : xESMF bilinear (ESMF weight generation only)",
-        "  kd_nearest     : pyresample kd_tree nearest-neighbour (full resample)",
-        "  kd_gauss       : pyresample kd_tree Gaussian-weighted (full resample)",
-        "  pr_bilinear    : pyresample XArrayBilinearResampler (full resample)",
+        "Algorithms compared (all via satpy unless noted):",
+        "  xesmf_bilinear       : xESMF bilinear (ESMF weight generation only)",
+        "  nearest (cold/warm)  : satpy KDTreeResampler nearest-neighbour",
+        "  bilinear (cold/warm) : satpy BilinearResampler",
+        "  ewa                  : satpy DaskEWAResampler (Elliptical Weighted Averaging; no caching)",
+        "  bucket_avg           : satpy BucketAvg (scatter-add average; no caching)",
         "",
-        "Excluded algorithms:",
-        "  EWA            : requires SwathDefinition source (scan-line swath data only)",
+        "cold = cache computed and written to disk on this run",
+        "warm = cache reloaded from disk (no recomputation)",
+        "",
+        "Caching notes:",
+        "  nearest/bilinear write zarr files to _data/amsr2/satpy-cache/",
+        "  EWA and BucketAvg have no precomputed index structures to cache",
+        "  xESMF writes a NetCDF weights file to _data/amsr2/amsr2-lis-weights.nc",
         "",
         header,
         sep,
@@ -265,16 +262,52 @@ def main() -> None:
     log.info("Loading data …")
     lis_grid = load_lis_grid(LIS_PATH)
     amsr2_ds = load_amsr2(amsr2_files[0])
-
     lis_area = build_lis_area_definition(LIS_PATH)
     amsr2_swath = build_amsr2_swath_definition(amsr2_ds)
 
-    results = [
-        bench_xesmf(amsr2_ds, lis_grid),
-        bench_kd_nearest(amsr2_ds, amsr2_swath, lis_area),
-        bench_kd_gauss(amsr2_ds, amsr2_swath, lis_area),
-        bench_pr_bilinear(amsr2_ds, amsr2_swath, lis_area),
-    ]
+    # Use a temporary cache dir so we always start cold for the benchmark
+    bench_cache = SATPY_CACHE.parent / "satpy-cache-bench"
+    if bench_cache.exists():
+        shutil.rmtree(bench_cache)
+    bench_cache.mkdir(parents=True)
+
+    try:
+        results = [
+            bench_xesmf(amsr2_ds, lis_grid),
+        ]
+
+        # For each cacheable satpy method: cold run then warm run
+        for label, fn in [
+            ("nearest", regrid_nearest),
+            ("bilinear", regrid_bilinear),
+        ]:
+            results.append(
+                _bench_satpy(
+                    label,
+                    fn,
+                    amsr2_ds,
+                    amsr2_swath,
+                    lis_area,
+                    bench_cache,
+                    has_cache=False,
+                )
+            )
+            results.append(
+                _bench_satpy(
+                    label,
+                    fn,
+                    amsr2_ds,
+                    amsr2_swath,
+                    lis_area,
+                    bench_cache,
+                    has_cache=True,
+                )
+            )
+
+        results.append(bench_ewa(amsr2_ds, amsr2_swath, lis_area))
+        results.append(bench_bucket_avg(amsr2_ds, amsr2_swath, lis_area))
+    finally:
+        shutil.rmtree(bench_cache, ignore_errors=True)
 
     report = render_report(results)
     print(report)
