@@ -9,6 +9,10 @@ version = "0.1.0"
 build-backend = "hatchling.build"
 requires = ["hatchling"]
 
+[tool.pyright]
+venvPath = "."
+venv = ".pixi/envs/default"
+
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64"]
@@ -28,6 +32,8 @@ h5netcdf = ">=1.8.1,<2"
 earthaccess = ">=0.17.0,<0.18"
 xesmf = ">=0.9.2,<0.10"
 pyresample = ">=1.35.0,<2"
+dask = ">=2026.3.0,<2027"
+zarr = ">=3.1.6,<4"
 
 [tool.pixi.feature.dev.dependencies]
 ipython = "*"
