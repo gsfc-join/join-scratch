@@ -394,7 +394,10 @@ def build_viirs_domain_mapping(
 
     # Tile name strings: "hHHvVV"
     tile_names = np.array(
-        [f"h{h:02d}v{v:02d}" for v, h in np.ndindex(n_tiles_y, n_tiles_x)],
+        [
+            f"h{h_min + h:02d}v{v_min + v:02d}"
+            for v, h in np.ndindex(n_tiles_y, n_tiles_x)
+        ],
         dtype="U8",
     ).reshape(n_tiles_y, n_tiles_x)
     tile_block = np.repeat(np.repeat(tile_names, n, axis=0), n, axis=1)
