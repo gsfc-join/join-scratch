@@ -559,20 +559,29 @@ def load_viirs_tiles_subset(
         xi = xi_flat[mask].astype(np.intp)
         yi = yi_flat[mask].astype(np.intp)
 
+        # h5py fancy indexing requires indices in strictly increasing order.
+        # Sort by (yi, xi) in row-major order and apply the same permutation
+        # to the lon/lat arrays so they stay aligned.
+        sort_order = np.lexsort((xi, yi))
+        xi_sorted = xi[sort_order]
+        yi_sorted = yi[sort_order]
+
         log.info("Loading VIIRS tile %s (%d domain pixels)", path, len(xi))
         if not stem:
             stem = path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
         with storage.open(path) as fobj:
             with h5py.File(fobj, "r") as f:
-                raw = f[_HDFEOS_DATA_PATH][yi, xi]  # uint8 (N_tile,)
+                raw = f[_HDFEOS_DATA_PATH][yi_sorted, xi_sorted]  # uint8 (N_tile,)
 
         data = raw.astype(np.float32)
         data[data > 100] = np.nan
 
         all_data.append(data)
-        all_lon.append(lon_flat[mask].astype(np.float64))
-        all_lat.append(lat_flat[mask].astype(np.float64))
+        lon_mask = lon_flat[mask]
+        lat_mask = lat_flat[mask]
+        all_lon.append(lon_mask[sort_order].astype(np.float64))
+        all_lat.append(lat_mask[sort_order].astype(np.float64))
 
     if not all_data:
         raise ValueError(
