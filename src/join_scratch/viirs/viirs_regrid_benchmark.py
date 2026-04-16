@@ -36,6 +36,7 @@ from join_scratch.viirs.viirs_regrid import (
     SATPY_CACHE,
     VIIRS_GLOB,
     build_viirs_swath_definition,
+    filter_tiles_by_domain,
     load_viirs_tiles,
     regrid_bilinear,
     regrid_bucket_avg,
@@ -207,9 +208,14 @@ def main() -> None:
     if not viirs_files:
         raise FileNotFoundError(f"No VIIRS files found with glob {VIIRS_GLOB!r}")
 
+    lis_area = build_lis_area_definition(storage)
+    log.info("Found %d VIIRS file(s); filtering to LIS domain …", len(viirs_files))
+    viirs_files = filter_tiles_by_domain(viirs_files, lis_area, storage)
+    if not viirs_files:
+        raise FileNotFoundError("No VIIRS tiles overlap the LIS domain.")
+
     log.info("Loading data …")
     tile = load_viirs_tiles(viirs_files, storage)
-    lis_area = build_lis_area_definition(storage)
     source_def = build_viirs_swath_definition(tile)
 
     # Temporary cache dir — always start cold for the benchmark

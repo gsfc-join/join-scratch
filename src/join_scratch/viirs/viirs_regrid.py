@@ -38,6 +38,9 @@ from pyresample.geometry import AreaDefinition, SwathDefinition
 from satpy.resample.bucket import BucketAvg
 from satpy.resample.kdtree import BilinearResampler, KDTreeResampler
 
+# Default buffer added around the LIS domain when filtering tiles (degrees)
+DOMAIN_FILTER_BUFFER_DEG: float = 2.0
+
 from join_scratch.amsr2.amsr2_regrid import build_lis_area_definition
 from join_scratch.storage import (
     StorageConfig,
@@ -102,6 +105,113 @@ RADIUS_OF_INFLUENCE = 600.0
 # ---------------------------------------------------------------------------
 # Tile loading
 # ---------------------------------------------------------------------------
+
+
+def _lis_lonlat_bounds(area: AreaDefinition) -> tuple[float, float, float, float]:
+    """Return (lon_min, lat_min, lon_max, lat_max) for a pyresample AreaDefinition.
+
+    Transforms all four corners of the projected extent to geographic
+    coordinates to handle non-rectangular (e.g. Lambert Conformal) domains.
+    """
+    x_min, y_min, x_max, y_max = area.area_extent
+    corners_xy = np.array(
+        [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]]
+    )
+    transformer = pyproj.Transformer.from_crs(area.crs, "EPSG:4326", always_xy=True)
+    lons, lats = transformer.transform(corners_xy[:, 0], corners_xy[:, 1])
+    return float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())
+
+
+def _tile_lonlat_bbox(
+    path: str, storage: "StorageConfig"
+) -> tuple[float, float, float, float]:
+    """Return (lon_min, lat_min, lon_max, lat_max) for a VIIRS tile.
+
+    Reads only the lightweight 1-D XDim/YDim coordinate vectors (3000 floats
+    each, ~48 KB total) and transforms the four extreme corners to lon/lat.
+    This avoids loading the 3000×3000 data array just to check overlap.
+    """
+    with storage.open(path) as fobj:
+        with h5py.File(fobj, "r") as f:
+            x_coords = f[_HDFEOS_XDIM_PATH][:]
+            y_coords = f[_HDFEOS_YDIM_PATH][:]
+
+    # The four corners of the tile bounding box in SIN projection
+    corners_x = np.array([x_coords[0], x_coords[-1], x_coords[-1], x_coords[0]])
+    corners_y = np.array([y_coords[0], y_coords[0], y_coords[-1], y_coords[-1]])
+    transformer = pyproj.Transformer.from_crs(_SIN_CRS, "EPSG:4326", always_xy=True)
+    lons, lats = transformer.transform(corners_x, corners_y)
+    return float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())
+
+
+def filter_tiles_by_domain(
+    paths: list[str],
+    area: AreaDefinition,
+    storage: "StorageConfig",
+    buffer_deg: float = DOMAIN_FILTER_BUFFER_DEG,
+) -> list[str]:
+    """Return only the tiles whose bounding box overlaps the LIS domain.
+
+    For each tile only the 1-D coordinate vectors are read (not the data
+    array), so this is cheap even for thousands of files.
+
+    Parameters
+    ----------
+    paths:
+        List of VIIRS tile paths as returned by ``StorageConfig.glob``.
+    area:
+        The target pyresample ``AreaDefinition`` (LIS domain).
+    storage:
+        Storage config used to open files.
+    buffer_deg:
+        Extra margin added to the LIS domain bounding box on all sides
+        (degrees).  Ensures tiles that only partially overlap the domain
+        edge are not accidentally excluded.
+
+    Returns
+    -------
+    list[str]
+        Subset of *paths* that overlap (or are within *buffer_deg* of) the
+        LIS domain.
+    """
+    lon_min, lat_min, lon_max, lat_max = _lis_lonlat_bounds(area)
+    lon_min -= buffer_deg
+    lat_min -= buffer_deg
+    lon_max += buffer_deg
+    lat_max += buffer_deg
+
+    log.info(
+        "LIS domain (lon/lat, +%.1f° buffer): %.2f–%.2f lon, %.2f–%.2f lat",
+        buffer_deg,
+        lon_min,
+        lon_max,
+        lat_min,
+        lat_max,
+    )
+
+    kept: list[str] = []
+    skipped = 0
+    for path in paths:
+        t_lon_min, t_lat_min, t_lon_max, t_lat_max = _tile_lonlat_bbox(path, storage)
+        overlaps = (
+            t_lon_max >= lon_min
+            and t_lon_min <= lon_max
+            and t_lat_max >= lat_min
+            and t_lat_min <= lat_max
+        )
+        if overlaps:
+            kept.append(path)
+        else:
+            skipped += 1
+            log.debug("Skipping tile outside domain: %s", path)
+
+    log.info(
+        "Tile filter: %d / %d tiles overlap the LIS domain (%d skipped)",
+        len(kept),
+        len(paths),
+        skipped,
+    )
+    return kept
 
 
 def _sin_to_lonlat(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -349,6 +459,14 @@ def main() -> None:
             f"No VIIRS files found matching '{VIIRS_GLOB}' in {storage.storage_location}"
         )
     log.info("Found %d VIIRS file(s)", len(viirs_files))
+
+    lis_area = build_lis_area_definition(storage)
+    lis_lons, lis_lats = lis_area.get_lonlats()
+
+    log.info("Filtering tiles to LIS domain …")
+    viirs_files = filter_tiles_by_domain(viirs_files, lis_area, storage)
+    if not viirs_files:
+        raise FileNotFoundError("No VIIRS tiles overlap the LIS domain.")
 
     # Group files by date (YYYYDDD encoded in filename, e.g. A2019001)
     date_groups: dict[str, list[str]] = defaultdict(list)
