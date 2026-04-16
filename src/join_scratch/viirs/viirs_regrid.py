@@ -550,7 +550,7 @@ def load_viirs_tiles_subset(
         # Find mapping pixels belonging to this tile
         mask = tile_flat == hv
         if not mask.any():
-            log.debug("No domain pixels for tile %s; skipping", hv)
+            log.debug("No domain pixels for tile %s in mapping; skipping", hv)
             continue
 
         xi = xi_flat[mask].astype(np.intp)
