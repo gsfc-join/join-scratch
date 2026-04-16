@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Regrid local CEDA ESA CCI SWE files to the LIS input grid.
+"""Regrid CEDA ESA CCI SWE files to the LIS input grid.
 
 The CEDA ESA CCI Snow SWE product (L3C daily) uses a global 0.1° regular
 lat/lon grid (1800 × 3600) — structurally identical to AMSR2.  Both xESMF
@@ -20,21 +20,26 @@ Caching
   as zarr files in _data/ceda/satpy-cache/.
 """
 
+import argparse
 import logging
 from pathlib import Path
 
 import numpy as np
-import pyproj
 import xarray as xr
 import xesmf
+from pyresample.ewa.dask_ewa import DaskEWAResampler
 from pyresample.geometry import AreaDefinition, SwathDefinition
-from satpy.resample.ewa import DaskEWAResampler
 from satpy.resample.bucket import BucketAvg
 from satpy.resample.kdtree import BilinearResampler, KDTreeResampler
 
 from join_scratch.amsr2.amsr2_regrid import (
     build_lis_area_definition,
     load_lis_grid,
+)
+from join_scratch.storage import (
+    StorageConfig,
+    add_storage_args,
+    storage_config_from_namespace,
 )
 
 logging.basicConfig(
@@ -48,13 +53,16 @@ log = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parents[3]
-DATA_RAW = ROOT / "_data-raw"
-DATA_OUT = ROOT / "_data" / "ceda"
-LIS_PATH = DATA_RAW / "lis_input_NMP_1000m_missouri.nc"
+_ROOT = Path(__file__).resolve().parents[3]
+_DATA_OUT = _ROOT / "_data" / "ceda"
+
+# Glob pattern and LIS file path relative to storage root
 CEDA_GLOB = "JOIN/CEDA/**/*.nc"
-WEIGHTS_PATH = DATA_OUT / "ceda-lis-weights.nc"
-SATPY_CACHE = DATA_OUT / "satpy-cache"
+LIS_RELPATH = "lis_input_NMP_1000m_missouri.nc"
+
+# Local output paths (output always written to local disk)
+WEIGHTS_PATH = _DATA_OUT / "ceda-lis-weights.nc"
+SATPY_CACHE = _DATA_OUT / "satpy-cache"
 
 # CEDA 0.1° grid has ~14 km diagonal at mid-latitudes; use 15 km ROI
 RADIUS_OF_INFLUENCE = 15_000.0
@@ -68,7 +76,7 @@ CEDA_VARS = ["swe", "swe_std"]
 # ---------------------------------------------------------------------------
 
 
-def load_ceda(path: Path) -> xr.Dataset:
+def load_ceda(path: str, storage: StorageConfig) -> xr.Dataset:
     """Load one CEDA SWE NetCDF file, squeeze the time dimension, and mask flags.
 
     Flag values (< 0) are masked to NaN in both swe and swe_std.
@@ -76,17 +84,16 @@ def load_ceda(path: Path) -> xr.Dataset:
     2-D arrays of shape (lat, lon).
     """
     log.info("Loading CEDA file %s", path)
-    ds = xr.open_dataset(path)
-    # Drop the size-1 time dimension
-    ds = ds.squeeze("time", drop=True)
-
-    # Keep only the variables we need
-    ds = ds[CEDA_VARS + ["lat", "lon"]]
-
-    # Mask flag values (< 0 are special flags, not physical values)
-    for var in CEDA_VARS:
-        ds[var] = ds[var].where(ds[var] >= 0)
-
+    with storage.open(path) as f:
+        ds = xr.open_dataset(f)
+        # Drop the size-1 time dimension
+        ds = ds.squeeze("time", drop=True)
+        # Keep only the variables we need
+        ds = ds[CEDA_VARS + ["lat", "lon"]]
+        # Mask flag values (< 0 are special flags, not physical values)
+        for var in CEDA_VARS:
+            ds[var] = ds[var].where(ds[var] >= 0)
+        ds.load()
     return ds
 
 
@@ -227,7 +234,7 @@ def regrid_ewa(
     source_def: SwathDefinition,
     target_def: AreaDefinition,
 ) -> np.ndarray:
-    """Regrid using satpy DaskEWAResampler.
+    """Regrid using DaskEWAResampler.
 
     Returns float32 (NY, NX, n_vars) array.
     """
@@ -270,7 +277,8 @@ def regrid_bucket_avg(
 
 
 def regrid_file(
-    ceda_path: Path,
+    ceda_path: str,
+    storage: StorageConfig,
     regridder: xesmf.Regridder,
     out_dir: Path,
 ) -> Path:
@@ -278,10 +286,11 @@ def regrid_file(
 
     Returns the path of the written output file.
     """
-    ds = load_ceda(ceda_path)
-    log.info("Regridding %s …", ceda_path.name)
+    ds = load_ceda(ceda_path, storage)
+    stem = ceda_path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    log.info("Regridding %s …", stem)
     regridded = regridder(ds)
-    out_path = out_dir / (ceda_path.stem + ".nc")
+    out_path = out_dir / (stem + ".nc")
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("Writing output to %s", out_path)
     regridded.to_netcdf(out_path, engine="h5netcdf")
@@ -294,23 +303,30 @@ def regrid_file(
 
 
 def main() -> None:
-    ceda_files = sorted(DATA_RAW.glob(CEDA_GLOB))
+    parser = argparse.ArgumentParser(
+        description="Regrid CEDA ESA CCI SWE files to the LIS input grid."
+    )
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
+    ceda_files = storage.glob(CEDA_GLOB)
     if not ceda_files:
         raise FileNotFoundError(
-            f"No CEDA files found matching '{CEDA_GLOB}' under {DATA_RAW}"
+            f"No CEDA files found matching '{CEDA_GLOB}' in {storage.storage_location}"
         )
     log.info("Found %d CEDA file(s)", len(ceda_files))
 
-    lis_grid = load_lis_grid(LIS_PATH)
+    lis_grid = load_lis_grid(storage)
 
     # All CEDA daily files share the same 0.1° grid — compute weights once
-    source_ds = load_ceda(ceda_files[0])
+    source_ds = load_ceda(ceda_files[0], storage)
     source_grid = source_ds[["lat", "lon"]]
     compute_weights(source_grid, lis_grid, WEIGHTS_PATH)
     regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
 
     for ceda_path in ceda_files:
-        out_path = regrid_file(ceda_path, regridder, DATA_OUT)
+        out_path = regrid_file(ceda_path, storage, regridder, _DATA_OUT)
         log.info("Done: %s", out_path)
 
     log.info("All CEDA files regridded successfully.")

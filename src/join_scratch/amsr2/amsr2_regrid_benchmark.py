@@ -17,6 +17,7 @@ Measures wall-clock time and peak RSS memory for each strategy and writes
 plain-text reports to _reports/ in the project root.
 """
 
+import argparse
 import gc
 import logging
 import resource
@@ -29,11 +30,9 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from join_scratch.amsr2_regrid import (
+from join_scratch.amsr2.amsr2_regrid import (
     AMSR2,
     AMSR2_GLOB,
-    DATA_RAW,
-    LIS_PATH,
     SATPY_CACHE,
     WEIGHTS_PATH,
     build_amsr2_swath_definition,
@@ -47,6 +46,10 @@ from join_scratch.amsr2_regrid import (
     regrid_ewa,
     regrid_nearest,
 )
+from join_scratch.storage import (
+    add_storage_args,
+    storage_config_from_namespace,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +58,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 REPORTS_DIR = ROOT / "_reports"
 
 
@@ -253,16 +256,23 @@ def render_report(results: list[BenchmarkResult]) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark AMSR2 regridding approaches."
+    )
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    amsr2_files = sorted(DATA_RAW.glob(AMSR2_GLOB))
+    amsr2_files = storage.glob(AMSR2_GLOB)
     if not amsr2_files:
-        raise FileNotFoundError(f"No AMSR2 files found under {DATA_RAW}")
+        raise FileNotFoundError(f"No AMSR2 files found in {storage.storage_location}")
 
     log.info("Loading data …")
-    lis_grid = load_lis_grid(LIS_PATH)
-    amsr2_ds = load_amsr2(amsr2_files[0])
-    lis_area = build_lis_area_definition(LIS_PATH)
+    lis_grid = load_lis_grid(storage)
+    amsr2_ds = load_amsr2(amsr2_files[0], storage)
+    lis_area = build_lis_area_definition(storage)
     amsr2_swath = build_amsr2_swath_definition(amsr2_ds)
 
     # Use a temporary cache dir so we always start cold for the benchmark

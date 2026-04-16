@@ -21,6 +21,9 @@ platforms = ["linux-64", "osx-arm64"]
 join_scratch = { path = ".", editable = true }
 
 [tool.pixi.tasks]
+bench_amsr2 = "python3 src/join_scratch/amsr2/amsr2_regrid_benchmark.py"
+bench_viirs = "python3 src/join_scratch/viirs/viirs_regrid_benchmark.py"
+bench_ceda = "python3 src/join_scratch/ceda/ceda_regrid_benchmark.py"
 
 [tool.pixi.dependencies]
 python = ">=3.14.4,<3.15"

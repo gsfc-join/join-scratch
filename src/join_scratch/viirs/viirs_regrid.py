@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Regrid local VIIRS CGF Snow Cover files to the LIS input grid.
+"""Regrid VIIRS CGF Snow Cover files to the LIS input grid.
 
 VIIRS VJ110A1F tiles use the MODIS Sinusoidal (SIN) projection stored in
 HDFEOS HDF5 files.  Each tile is 3000×3000 pixels at 375 m resolution.
@@ -21,7 +21,9 @@ Valid NDSI snow cover values are 0–100.  Special flags (>100) such as 201
 255 (fill) are masked to NaN before regridding.
 """
 
+import argparse
 import logging
+from collections import defaultdict
 from pathlib import Path
 
 import h5py
@@ -31,12 +33,17 @@ import xarray as xr
 from pyproj.crs import GeographicCRS, ProjectedCRS
 from pyproj.crs.coordinate_operation import SinusoidalConversion
 from pyproj.crs.datum import CustomDatum, CustomEllipsoid
+from pyresample.ewa.dask_ewa import DaskEWAResampler
 from pyresample.geometry import AreaDefinition, SwathDefinition
 from satpy.resample.bucket import BucketAvg
-from satpy.resample.ewa import DaskEWAResampler
 from satpy.resample.kdtree import BilinearResampler, KDTreeResampler
 
 from join_scratch.amsr2.amsr2_regrid import build_lis_area_definition
+from join_scratch.storage import (
+    StorageConfig,
+    add_storage_args,
+    storage_config_from_namespace,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,13 +56,15 @@ log = logging.getLogger(__name__)
 # Paths
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parents[3]
-DATA_RAW = ROOT / "_data-raw"
-DATA_OUT = ROOT / "_data" / "viirs"
-LIS_PATH = DATA_RAW / "lis_input_NMP_1000m_missouri.nc"
+_ROOT = Path(__file__).resolve().parents[3]
+_DATA_OUT = _ROOT / "_data" / "viirs"
+
+# Glob pattern and LIS file relative to storage root
 VIIRS_GLOB = "JOIN/VIIRS/**/*.h5"
-# Satpy caches neighbour-lookup tables as zarr files; shared across methods.
-SATPY_CACHE = DATA_OUT / "satpy-cache"
+LIS_RELPATH = "lis_input_NMP_1000m_missouri.nc"
+
+# Local output path (output always written to local disk)
+SATPY_CACHE = _DATA_OUT / "satpy-cache"
 
 # ---------------------------------------------------------------------------
 # VIIRS constants
@@ -105,7 +114,7 @@ def _sin_to_lonlat(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return transformer.transform(x, y)
 
 
-def load_viirs_tile(path: Path) -> dict:
+def load_viirs_tile(path: str, storage: StorageConfig) -> dict:
     """Load one VIIRS HDF5 tile and return a dict with keys:
 
     - ``data``: float32 (ny, nx) array, flag values (>100) masked to NaN
@@ -117,10 +126,12 @@ def load_viirs_tile(path: Path) -> dict:
     2-D meshgrid and transformed to geographic coordinates via pyproj.
     """
     log.info("Loading VIIRS tile %s", path)
-    with h5py.File(path, "r") as f:
-        raw = f[_HDFEOS_DATA_PATH][:]  # uint8 (ny, nx)
-        x_coords = f[_HDFEOS_XDIM_PATH][:]  # float64 (nx,) in metres
-        y_coords = f[_HDFEOS_YDIM_PATH][:]  # float64 (ny,) in metres
+    stem = path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    with storage.open(path) as fobj:
+        with h5py.File(fobj, "r") as f:
+            raw = f[_HDFEOS_DATA_PATH][:]  # uint8 (ny, nx)
+            x_coords = f[_HDFEOS_XDIM_PATH][:]  # float64 (nx,) in metres
+            y_coords = f[_HDFEOS_YDIM_PATH][:]  # float64 (ny,) in metres
 
     # Mask special-flag values (valid data: 0–100)
     data = raw.astype(np.float32)
@@ -134,11 +145,11 @@ def load_viirs_tile(path: Path) -> dict:
         "data": data,
         "lon2d": lon2d,
         "lat2d": lat2d,
-        "stem": path.stem,
+        "stem": stem,
     }
 
 
-def load_viirs_tiles(paths: list[Path]) -> dict:
+def load_viirs_tiles(paths: list[str], storage: StorageConfig) -> dict:
     """Load and composite multiple VIIRS tiles into a single swath.
 
     Tiles are stacked along the row axis (axis 0).  This produces one large
@@ -149,9 +160,9 @@ def load_viirs_tiles(paths: list[Path]) -> dict:
     ``stem`` derived from the first tile's date component.
     """
     if len(paths) == 1:
-        return load_viirs_tile(paths[0])
+        return load_viirs_tile(paths[0], storage)
 
-    tiles = [load_viirs_tile(p) for p in paths]
+    tiles = [load_viirs_tile(p, storage) for p in paths]
     return {
         "data": np.concatenate([t["data"] for t in tiles], axis=0),
         "lon2d": np.concatenate([t["lon2d"] for t in tiles], axis=0),
@@ -234,7 +245,7 @@ def regrid_ewa(
     source_def: SwathDefinition,
     target_def: AreaDefinition,
 ) -> np.ndarray:
-    """Regrid using satpy DaskEWAResampler (Elliptical Weighted Averaging).
+    """Regrid using DaskEWAResampler (Elliptical Weighted Averaging).
 
     rows_per_scan=0 disables scan-line grouping; no caching supported.
     Returns a float32 (NY, NX) array.
@@ -325,33 +336,38 @@ def regrid_tile_to_nc(
 
 
 def main() -> None:
-    viirs_files = sorted(DATA_RAW.glob(VIIRS_GLOB))
+    parser = argparse.ArgumentParser(
+        description="Regrid VIIRS CGF Snow Cover files to the LIS input grid."
+    )
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
+    viirs_files = storage.glob(VIIRS_GLOB)
     if not viirs_files:
         raise FileNotFoundError(
-            f"No VIIRS files found matching '{VIIRS_GLOB}' under {DATA_RAW}"
+            f"No VIIRS files found matching '{VIIRS_GLOB}' in {storage.storage_location}"
         )
     log.info("Found %d VIIRS file(s)", len(viirs_files))
 
     # Group files by date (YYYYDDD encoded in filename, e.g. A2019001)
-    from collections import defaultdict
-
-    date_groups: dict[str, list[Path]] = defaultdict(list)
+    date_groups: dict[str, list[str]] = defaultdict(list)
     for p in viirs_files:
-        # Filename format: VJ110A1F.A2019001.h00v08.002.<ts>.h5
-        parts = p.stem.split(".")
-        date_key = parts[1] if len(parts) > 1 else p.stem
+        stem = p.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        parts = stem.split(".")
+        date_key = parts[1] if len(parts) > 1 else stem
         date_groups[date_key].append(p)
 
-    lis_area = build_lis_area_definition(LIS_PATH)
+    lis_area = build_lis_area_definition(storage)
     lis_lons, lis_lats = lis_area.get_lonlats()
 
     for date_key, paths in sorted(date_groups.items()):
         log.info("Processing date %s (%d tile(s))", date_key, len(paths))
-        tile = load_viirs_tiles(paths)
+        tile = load_viirs_tiles(paths, storage)
         source_def = build_viirs_swath_definition(tile)
 
         out_path = regrid_tile_to_nc(
-            tile, source_def, lis_area, lis_lons, lis_lats, DATA_OUT
+            tile, source_def, lis_area, lis_lons, lis_lats, _DATA_OUT
         )
         log.info("Done: %s", out_path)
 

@@ -11,6 +11,7 @@ Compares wall-clock time and RSS memory for:
 Writes a plain-text report to _reports/ceda_regrid_benchmark.txt.
 """
 
+import argparse
 import gc
 import logging
 import resource
@@ -25,8 +26,6 @@ import xarray as xr
 from join_scratch.amsr2.amsr2_regrid import build_lis_area_definition, load_lis_grid
 from join_scratch.ceda.ceda_regrid import (
     CEDA_GLOB,
-    DATA_RAW,
-    LIS_PATH,
     SATPY_CACHE,
     WEIGHTS_PATH,
     build_ceda_swath_definition,
@@ -37,6 +36,10 @@ from join_scratch.ceda.ceda_regrid import (
     regrid_bucket_avg,
     regrid_ewa,
     regrid_nearest,
+)
+from join_scratch.storage import (
+    add_storage_args,
+    storage_config_from_namespace,
 )
 
 logging.basicConfig(
@@ -212,16 +215,23 @@ def render_report(results: list[BenchmarkResult]) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark CEDA ESA CCI SWE regridding approaches."
+    )
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    ceda_files = sorted(DATA_RAW.glob(CEDA_GLOB))
+    ceda_files = storage.glob(CEDA_GLOB)
     if not ceda_files:
-        raise FileNotFoundError(f"No CEDA files found under {DATA_RAW}")
+        raise FileNotFoundError(f"No CEDA files found in {storage.storage_location}")
 
     log.info("Loading data …")
-    lis_grid = load_lis_grid(LIS_PATH)
-    ceda_ds = load_ceda(ceda_files[0])
-    lis_area = build_lis_area_definition(LIS_PATH)
+    lis_grid = load_lis_grid(storage)
+    ceda_ds = load_ceda(ceda_files[0], storage)
+    lis_area = build_lis_area_definition(storage)
     ceda_swath = build_ceda_swath_definition(ceda_ds)
 
     bench_cache = SATPY_CACHE.parent / "satpy-cache-bench"

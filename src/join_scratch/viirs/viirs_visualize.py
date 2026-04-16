@@ -29,6 +29,7 @@ appropriate in principle.  However for CEDA/AMSR2 0.1° (≈11 km) → LIS 1 km,
 the source is much coarser and bucket_avg will produce a mostly empty result.
 """
 
+import argparse
 import logging
 from pathlib import Path
 
@@ -36,9 +37,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from join_scratch.amsr2.amsr2_regrid import build_lis_area_definition
+from join_scratch.storage import (
+    StorageConfig,
+    add_storage_args,
+    storage_config_from_namespace,
+)
 from join_scratch.viirs.viirs_regrid import (
-    DATA_RAW,
-    LIS_PATH,
     SATPY_CACHE,
     VIIRS_GLOB,
     build_viirs_swath_definition,
@@ -85,7 +89,9 @@ def _lis_boundary_lonlat(lis_area) -> tuple[np.ndarray, np.ndarray]:
     return b_lons, b_lats
 
 
-def _tile_lonlat_extent(files: list[Path]) -> tuple[float, float, float, float]:
+def _tile_lonlat_extent(
+    files: list[str], storage: StorageConfig
+) -> tuple[float, float, float, float]:
     """Read bounding coordinates from file metadata (faster than computing from projection).
 
     Returns (lon_min, lon_max, lat_min, lat_max).
@@ -94,12 +100,13 @@ def _tile_lonlat_extent(files: list[Path]) -> tuple[float, float, float, float]:
 
     lons_w, lons_e, lats_s, lats_n = [], [], [], []
     for p in files:
-        with h5py.File(p, "r") as f:
-            attrs = dict(f.attrs)
-            lons_w.append(float(attrs["WestBoundingCoord"].item()))
-            lons_e.append(float(attrs["EastBoundingCoord"].item()))
-            lats_s.append(float(attrs["SouthBoundingCoord"].item()))
-            lats_n.append(float(attrs["NorthBoundingCoord"].item()))
+        with storage.open(p) as fobj:
+            with h5py.File(fobj, "r") as f:
+                attrs = dict(f.attrs)
+                lons_w.append(float(attrs["WestBoundingCoord"]))
+                lons_e.append(float(attrs["EastBoundingCoord"]))
+                lats_s.append(float(attrs["SouthBoundingCoord"]))
+                lats_n.append(float(attrs["NorthBoundingCoord"]))
     return min(lons_w), max(lons_e), min(lats_s), max(lats_n)
 
 
@@ -109,20 +116,25 @@ def _tile_lonlat_extent(files: list[Path]) -> tuple[float, float, float, float]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Visualize VIIRS regridding results.")
+    add_storage_args(parser)
+    args = parser.parse_args()
+    storage = storage_config_from_namespace(args)
+
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    viirs_files = sorted(DATA_RAW.glob(VIIRS_GLOB))
+    viirs_files = storage.glob(VIIRS_GLOB)
     if not viirs_files:
-        raise FileNotFoundError(f"No VIIRS files found under {DATA_RAW}")
+        raise FileNotFoundError(f"No VIIRS files found with glob {VIIRS_GLOB!r}")
 
     log.info("Loading VIIRS tile(s) …")
-    tile = load_viirs_tiles(viirs_files)
-    lis_area = build_lis_area_definition(LIS_PATH)
+    tile = load_viirs_tiles(viirs_files, storage)
+    lis_area = build_lis_area_definition(storage)
     source_def = build_viirs_swath_definition(tile)
     lis_lons, lis_lats = lis_area.get_lonlats()
 
     # --- Tile geographic extent from metadata ---
-    lon_min, lon_max, lat_min, lat_max = _tile_lonlat_extent(viirs_files)
+    lon_min, lon_max, lat_min, lat_max = _tile_lonlat_extent(viirs_files, storage)
     log.info(
         "Tile bounding box: lon [%.2f, %.2f]  lat [%.2f, %.2f]",
         lon_min,
@@ -239,7 +251,7 @@ def main() -> None:
             )
 
     # Derive a date string from the first filename for the output name
-    first_stem = viirs_files[0].stem
+    first_stem = Path(viirs_files[0]).stem
     parts = first_stem.split(".")
     date_part = parts[1] if len(parts) > 1 else first_stem
     fname = f"{date_part}_viirs_regrid_comparison.png"

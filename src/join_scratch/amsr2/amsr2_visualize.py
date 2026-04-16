@@ -11,16 +11,15 @@ The inner dimension of size 2 (two retrieval channels) is shown side-by-side
 in each row.
 """
 
+import argparse
 import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from join_scratch.amsr2_regrid import (
+from join_scratch.amsr2.amsr2_regrid import (
     AMSR2_GLOB,
-    DATA_RAW,
-    LIS_PATH,
     WEIGHTS_PATH,
     build_amsr2_swath_definition,
     build_lis_area_definition,
@@ -32,6 +31,11 @@ from join_scratch.amsr2_regrid import (
     regrid_ewa,
     regrid_nearest,
 )
+from join_scratch.storage import (
+    StorageConfig,
+    add_storage_args,
+    storage_config_from_namespace,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 FIGURES_DIR = ROOT / "_figures"
 
 N_INNER = 2
@@ -85,16 +89,21 @@ def _lis_boundary_lonlat(lis_area) -> tuple[np.ndarray, np.ndarray]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Visualize AMSR2 regridding results.")
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    amsr2_files = sorted(DATA_RAW.glob(AMSR2_GLOB))
+    amsr2_files = storage.glob(AMSR2_GLOB)
     if not amsr2_files:
-        raise FileNotFoundError(f"No AMSR2 files found under {DATA_RAW}")
+        raise FileNotFoundError(f"No AMSR2 files found in {storage.storage_location}")
 
     log.info("Loading data …")
-    lis_grid = load_lis_grid(LIS_PATH)
-    amsr2_ds = load_amsr2(amsr2_files[0])
-    lis_area = build_lis_area_definition(LIS_PATH)
+    lis_grid = load_lis_grid(storage)
+    amsr2_ds = load_amsr2(amsr2_files[0], storage)
+    lis_area = build_lis_area_definition(storage)
     amsr2_swath = build_amsr2_swath_definition(amsr2_ds)
     lis_lons, lis_lats = lis_area.get_lonlats()
 
@@ -181,7 +190,8 @@ def main() -> None:
             ax.set_ylabel("Latitude")
             fig.colorbar(pcm, ax=ax, label="Snow depth (cm × 0.1)", shrink=0.85)
 
-    fname = amsr2_files[0].stem + "_regrid_comparison.png"
+    first_stem = amsr2_files[0].rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    fname = first_stem + "_regrid_comparison.png"
     out_path = FIGURES_DIR / fname
     fig.savefig(out_path, dpi=150)
     plt.close(fig)

@@ -16,6 +16,7 @@ regular lon/lat grid — xESMF requires a rectilinear source.
 Writes a plain-text report to _reports/viirs_regrid_benchmark.txt.
 """
 
+import argparse
 import gc
 import logging
 import resource
@@ -26,9 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from join_scratch.amsr2.amsr2_regrid import build_lis_area_definition
+from join_scratch.storage import (
+    StorageConfig,
+    add_storage_args,
+    storage_config_from_namespace,
+)
 from join_scratch.viirs.viirs_regrid import (
-    DATA_RAW,
-    LIS_PATH,
     SATPY_CACHE,
     VIIRS_GLOB,
     build_viirs_swath_definition,
@@ -192,15 +196,20 @@ def render_report(results: list[BenchmarkResult]) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark VIIRS regridding methods.")
+    add_storage_args(parser)
+    args = parser.parse_args()
+    storage = storage_config_from_namespace(args)
+
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    viirs_files = sorted(DATA_RAW.glob(VIIRS_GLOB))
+    viirs_files = storage.glob(VIIRS_GLOB)
     if not viirs_files:
-        raise FileNotFoundError(f"No VIIRS files found under {DATA_RAW}")
+        raise FileNotFoundError(f"No VIIRS files found with glob {VIIRS_GLOB!r}")
 
     log.info("Loading data …")
-    tile = load_viirs_tiles(viirs_files)
-    lis_area = build_lis_area_definition(LIS_PATH)
+    tile = load_viirs_tiles(viirs_files, storage)
+    lis_area = build_lis_area_definition(storage)
     source_def = build_viirs_swath_definition(tile)
 
     # Temporary cache dir — always start cold for the benchmark

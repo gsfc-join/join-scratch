@@ -11,6 +11,7 @@ Produces a single PNG in _figures/ with:
 Two columns: left = swe, right = swe_std.
 """
 
+import argparse
 import logging
 from pathlib import Path
 
@@ -25,8 +26,6 @@ from join_scratch.amsr2.amsr2_regrid import (
 from join_scratch.ceda.ceda_regrid import (
     CEDA_GLOB,
     CEDA_VARS,
-    DATA_RAW,
-    LIS_PATH,
     SATPY_CACHE,
     WEIGHTS_PATH,
     build_ceda_swath_definition,
@@ -35,6 +34,10 @@ from join_scratch.ceda.ceda_regrid import (
     regrid_bucket_avg,
     regrid_ewa,
     regrid_nearest,
+)
+from join_scratch.storage import (
+    add_storage_args,
+    storage_config_from_namespace,
 )
 
 logging.basicConfig(
@@ -80,16 +83,23 @@ def _lis_boundary_lonlat(lis_area) -> tuple[np.ndarray, np.ndarray]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Visualize CEDA ESA CCI SWE regridding results."
+    )
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    ceda_files = sorted(DATA_RAW.glob(CEDA_GLOB))
+    ceda_files = storage.glob(CEDA_GLOB)
     if not ceda_files:
-        raise FileNotFoundError(f"No CEDA files found under {DATA_RAW}")
+        raise FileNotFoundError(f"No CEDA files found in {storage.storage_location}")
 
     log.info("Loading data …")
-    lis_grid = load_lis_grid(LIS_PATH)
-    ceda_ds = load_ceda(ceda_files[0])
-    lis_area = build_lis_area_definition(LIS_PATH)
+    lis_grid = load_lis_grid(storage)
+    ceda_ds = load_ceda(ceda_files[0], storage)
+    lis_area = build_lis_area_definition(storage)
     ceda_swath = build_ceda_swath_definition(ceda_ds)
     lis_lons, lis_lats = lis_area.get_lonlats()
 
@@ -177,7 +187,8 @@ def main() -> None:
             ax.set_ylabel("Latitude")
             fig.colorbar(pcm, ax=ax, label=VAR_LABELS[var], shrink=0.85)
 
-    date_part = ceda_files[0].name.split("-")[0]  # e.g. "20190101"
+    first_name = ceda_files[0].rstrip("/").rsplit("/", 1)[-1]
+    date_part = first_name.split("-")[0]  # e.g. "20190101"
     fname = f"{date_part}_ceda_regrid_comparison.png"
     out_path = FIGURES_DIR / fname
     fig.savefig(out_path, dpi=150)

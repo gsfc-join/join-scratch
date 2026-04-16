@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-"""Regrid local AMSR2 snow depth files to the LIS input grid."""
+"""Regrid AMSR2 snow depth files to the LIS input grid."""
 
+import argparse
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,9 +11,15 @@ import pyproj
 import xarray as xr
 import xesmf
 from pyresample.geometry import AreaDefinition, SwathDefinition
+from pyresample.ewa.dask_ewa import DaskEWAResampler
 from satpy.resample.bucket import BucketAvg
-from satpy.resample.ewa import DaskEWAResampler
 from satpy.resample.kdtree import BilinearResampler, KDTreeResampler
+
+from join_scratch.storage import (
+    StorageConfig,
+    add_storage_args,
+    storage_config_from_namespace,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,19 +29,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (local-only; used as defaults when storage_type='local')
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parents[2]
-DATA_RAW = ROOT / "_data-raw"
-DATA_OUT = ROOT / "_data" / "amsr2"
-LIS_PATH = DATA_RAW / "lis_input_NMP_1000m_missouri.nc"
+_ROOT = Path(__file__).resolve().parents[3]
+_DATA_OUT = _ROOT / "_data" / "amsr2"
+
+# Glob pattern for AMSR2 files, relative to storage root
 AMSR2_GLOB = "JOIN/AMSR2/**/*.h5"
-WEIGHTS_PATH = DATA_OUT / "amsr2-lis-weights.nc"
-# Satpy caches neighbour-lookup tables as zarr files keyed by a hash of the
-# source/target geometry.  The same directory is shared across all satpy
-# methods that support caching (nearest, bilinear, ewa).
-SATPY_CACHE = DATA_OUT / "satpy-cache"
+
+# LIS file path relative to storage root
+LIS_RELPATH = "lis_input_NMP_1000m_missouri.nc"
+
+# Local output paths (output always goes to local disk)
+WEIGHTS_PATH = _DATA_OUT / "amsr2-lis-weights.nc"
+SATPY_CACHE = _DATA_OUT / "satpy-cache"
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +78,7 @@ AMSR2 = Amsr2Constants()
 # ---------------------------------------------------------------------------
 
 
-def load_lis_grid(path: Path) -> xr.Dataset:
+def load_lis_grid(storage: StorageConfig) -> xr.Dataset:
     """Load the LIS input file and return a dataset with lat/lon/lat_b/lon_b.
 
     The LIS file stores rows south-first (row 0 = southernmost).  This
@@ -77,18 +86,20 @@ def load_lis_grid(path: Path) -> xr.Dataset:
     row 0 = northernmost, matching the convention used by pyresample
     AreaDefinition and producing consistent output across all regrid methods.
     """
-    log.info("Loading LIS grid from %s", path)
-    ds = xr.open_dataset(path, engine="h5netcdf")
-    ds = ds[["lat", "lon", "lat_b", "lon_b"]]
-    # Flip to north-first row ordering
-    ds = ds.isel(
-        north_south=slice(None, None, -1),
-        north_south_b=slice(None, None, -1),
-    )
+    log.info("Loading LIS grid from storage (%s)", storage.storage_type)
+    with storage.open(LIS_RELPATH) as f:
+        ds = xr.open_dataset(f, engine="h5netcdf")
+        ds = ds[["lat", "lon", "lat_b", "lon_b"]]
+        # Flip to north-first row ordering
+        ds = ds.isel(
+            north_south=slice(None, None, -1),
+            north_south_b=slice(None, None, -1),
+        )
+        ds.load()
     return ds
 
 
-def build_lis_area_definition(path: Path) -> AreaDefinition:
+def build_lis_area_definition(storage: StorageConfig) -> AreaDefinition:
     """Construct a pyresample AreaDefinition for the LIS Lambert Conformal grid.
 
     All parameters are read from the global attributes of the LIS input file:
@@ -101,7 +112,10 @@ def build_lis_area_definition(path: Path) -> AreaDefinition:
     area_extent (x_ll, y_ll, x_ur, y_ur) reconciles this with LIS's
     south-first row ordering automatically.
     """
-    ds = xr.open_dataset(path, engine="h5netcdf")
+    with storage.open(LIS_RELPATH) as f:
+        ds = xr.open_dataset(f, engine="h5netcdf")
+        ds.load()
+
     attrs = ds.attrs
 
     sw_lat = float(attrs["SOUTH_WEST_CORNER_LAT"])
@@ -163,21 +177,22 @@ def build_amsr2_swath_definition(ds: xr.Dataset) -> SwathDefinition:
 # ---------------------------------------------------------------------------
 
 
-def load_amsr2(path: Path) -> xr.Dataset:
+def load_amsr2(path: str, storage: StorageConfig) -> xr.Dataset:
     """Load an AMSR2 HDF5 file, assign coordinates, and mask invalid values.
 
     Returns the full global dataset ready for regridding.
     """
     log.info("Loading AMSR2 file %s", path)
-    ds = (
-        xr.open_dataset(path, engine="h5netcdf", phony_dims="sort")
-        .rename_dims({"phony_dim_0": "lat", "phony_dim_1": "lon"})
-        .assign_coords(lat=AMSR2.lat, lon=AMSR2.lon)
-        .sortby(["lat", "lon"])
-    )
-
-    # Mask fill values (valid data is >= 0)
-    ds = ds.where(ds["Geophysical Data"] >= 0)
+    with storage.open(path) as f:
+        ds = (
+            xr.open_dataset(f, engine="h5netcdf", phony_dims="sort")
+            .rename_dims({"phony_dim_0": "lat", "phony_dim_1": "lon"})
+            .assign_coords(lat=AMSR2.lat, lon=AMSR2.lon)
+            .sortby(["lat", "lon"])
+        )
+        # Mask fill values (valid data is >= 0)
+        ds = ds.where(ds["Geophysical Data"] >= 0)
+        ds.load()
     return ds
 
 
@@ -321,7 +336,7 @@ def regrid_ewa(
     source_def: SwathDefinition,
     target_def: AreaDefinition,
 ) -> np.ndarray:
-    """Regrid using satpy DaskEWAResampler (Elliptical Weighted Averaging).
+    """Regrid using DaskEWAResampler (Elliptical Weighted Averaging).
 
     EWA is designed for scan-line satellite data but works for any
     SwathDefinition source; rows_per_scan=0 disables scan-line grouping so
@@ -369,7 +384,8 @@ def regrid_bucket_avg(
 
 
 def regrid_file(
-    amsr2_path: Path,
+    amsr2_path: str,
+    storage: StorageConfig,
     regridder: xesmf.Regridder,
     out_dir: Path,
 ) -> Path:
@@ -377,12 +393,13 @@ def regrid_file(
 
     Returns the path of the written output file.
     """
-    ds = load_amsr2(amsr2_path)
+    ds = load_amsr2(amsr2_path, storage)
 
-    log.info("Regridding %s …", amsr2_path.name)
+    stem = amsr2_path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    log.info("Regridding %s …", stem)
     regridded = regridder(ds)
 
-    out_path = out_dir / (amsr2_path.stem + ".nc")
+    out_path = out_dir / (stem + ".nc")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("Writing output to %s", out_path)
@@ -397,24 +414,31 @@ def regrid_file(
 
 
 def main() -> None:
-    amsr2_files = sorted(DATA_RAW.glob(AMSR2_GLOB))
+    parser = argparse.ArgumentParser(
+        description="Regrid AMSR2 snow depth files to the LIS input grid."
+    )
+    add_storage_args(parser)
+    ns = parser.parse_args()
+    storage = storage_config_from_namespace(ns)
+
+    amsr2_files = storage.glob(AMSR2_GLOB)
     if not amsr2_files:
         raise FileNotFoundError(
-            f"No AMSR2 files found matching '{AMSR2_GLOB}' under {DATA_RAW}"
+            f"No AMSR2 files found matching '{AMSR2_GLOB}' in {storage.storage_location}"
         )
     log.info("Found %d AMSR2 file(s)", len(amsr2_files))
 
-    lis_grid = load_lis_grid(LIS_PATH)
+    lis_grid = load_lis_grid(storage)
 
     # All AMSR2 files share the same 0.1° equirectangular grid, so one set of
     # weights covers all files. Compute them from the first file's grid.
-    source_ds = load_amsr2(amsr2_files[0])
+    source_ds = load_amsr2(amsr2_files[0], storage)
     source_grid = source_ds[["lat", "lon"]]
     compute_weights(source_grid, lis_grid, WEIGHTS_PATH)
     regridder = load_regridder(source_grid, lis_grid, WEIGHTS_PATH)
 
     for amsr2_path in amsr2_files:
-        out_path = regrid_file(amsr2_path, regridder, DATA_OUT)
+        out_path = regrid_file(amsr2_path, storage, regridder, _DATA_OUT)
         log.info("Done: %s", out_path)
 
     log.info("All files regridded successfully.")
