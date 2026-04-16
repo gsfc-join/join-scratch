@@ -229,6 +229,200 @@ def filter_tiles_by_domain(
     return kept
 
 
+# MODIS SIN grid constants (shared by multiple functions)
+_SIN_R = 6371007.181  # sphere radius (metres)
+_SIN_TILE_W = 2 * np.pi * _SIN_R / 36  # tile width  ≈ 1,111,950 m
+_SIN_TILE_H = np.pi * _SIN_R / 18  # tile height ≈ 1,111,950 m
+_SIN_PIXELS_PER_TILE = 3000  # pixels per tile per axis (375 m product)
+_SIN_PIXEL_SIZE = _SIN_TILE_W / _SIN_PIXELS_PER_TILE  # ≈ 370.65 m
+
+
+def build_viirs_domain_mapping(
+    bbox: tuple[float, float, float, float],
+    buffer_deg: float = DOMAIN_FILTER_BUFFER_DEG,
+) -> xr.Dataset:
+    """Build a VIIRS pixel mapping dataset for a spatial domain.
+
+    Computes every VIIRS pixel that falls within *bbox* (with *buffer_deg*
+    margin) purely from the MODIS SIN grid geometry — no file I/O required.
+
+    The result is an ``xr.Dataset`` laid out as a 2-D composite grid in SIN
+    projection.  Rows correspond to tile rows (v-index, top-to-bottom); columns
+    to tile columns (h-index, left-to-right).  Within each tile block the
+    3000×3000 pixel indices are unrolled in row-major order.
+
+    Parameters
+    ----------
+    bbox:
+        ``(lon_min, lat_min, lon_max, lat_max)`` in degrees.  The region of
+        interest.  A *buffer_deg* margin is added before tile selection.
+    buffer_deg:
+        Extra margin (degrees) added to *bbox* before selecting tiles.
+
+    Returns
+    -------
+    xr.Dataset
+        Dimensions: ``y`` (rows in composite grid), ``x`` (columns).
+        Coordinates: ``sin_x`` (metres), ``sin_y`` (metres) — SIN projection
+        coordinates of each pixel centre; ``lon``, ``lat`` (degrees).
+        Data variables:
+          - ``tile``    : str, ``"hHHvVV"`` tile identifier
+          - ``tile_xi`` : int16, pixel column index within the tile (0–2999)
+          - ``tile_yi`` : int16, pixel row index within the tile (0–2999)
+
+        Only pixels whose (lon, lat) fall within *bbox* (+ buffer) are
+        included; pixels outside the domain are masked (NaN / empty string).
+    """
+    lon_min, lat_min, lon_max, lat_max = bbox
+    lon_min -= buffer_deg
+    lat_min -= buffer_deg
+    lon_max += buffer_deg
+    lat_max += buffer_deg
+
+    # ------------------------------------------------------------------
+    # Step 1: find which (h, v) tile indices overlap the buffered bbox.
+    # Convert bbox lon/lat corners to SIN metres to determine the range.
+    # ------------------------------------------------------------------
+    to_sin = pyproj.Transformer.from_crs("EPSG:4326", _SIN_CRS, always_xy=True)
+    to_geo = pyproj.Transformer.from_crs(_SIN_CRS, "EPSG:4326", always_xy=True)
+
+    # Sample the bbox boundary densely so curved projections don't cause gaps
+    n_samples = 100
+    edge_lons = np.concatenate(
+        [
+            np.linspace(lon_min, lon_max, n_samples),  # south edge
+            np.full(n_samples, lon_max),  # east edge
+            np.linspace(lon_max, lon_min, n_samples),  # north edge
+            np.full(n_samples, lon_min),  # west edge
+        ]
+    )
+    edge_lats = np.concatenate(
+        [
+            np.full(n_samples, lat_min),
+            np.linspace(lat_min, lat_max, n_samples),
+            np.full(n_samples, lat_max),
+            np.linspace(lat_max, lat_min, n_samples),
+        ]
+    )
+    edge_x, edge_y = to_sin.transform(edge_lons, edge_lats)
+
+    h_vals = np.floor(edge_x / _SIN_TILE_W + 18).astype(int)
+    v_vals = np.floor(9 - edge_y / _SIN_TILE_H).astype(int)
+    h_min, h_max = int(h_vals.min()), int(h_vals.max())
+    v_min, v_max = int(v_vals.min()), int(v_vals.max())
+
+    # Clamp to valid MODIS tile range
+    h_min = max(0, h_min)
+    h_max = min(35, h_max)
+    v_min = max(0, v_min)
+    v_max = min(17, v_max)
+
+    n_tiles_x = h_max - h_min + 1
+    n_tiles_y = v_max - v_min + 1
+    n = _SIN_PIXELS_PER_TILE
+    total_x = n_tiles_x * n
+    total_y = n_tiles_y * n
+
+    log.info(
+        "Domain mapping: tiles h%02d–h%02d × v%02d–v%02d (%d×%d tiles, %d×%d pixels)",
+        h_min,
+        h_max,
+        v_min,
+        v_max,
+        n_tiles_x,
+        n_tiles_y,
+        total_x,
+        total_y,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: build full composite pixel coordinate arrays (no file I/O).
+    # ------------------------------------------------------------------
+    # 1-D SIN coordinate vectors for the composite grid
+    # x increases left→right; y increases top→bottom (v increases southward)
+    x_tile_origins = np.array([(h - 18) * _SIN_TILE_W for h in range(h_min, h_max + 1)])
+    y_tile_origins = np.array(
+        [(9 - v - 1) * _SIN_TILE_H for v in range(v_min, v_max + 1)]
+    )
+
+    # Pixel-centre offsets within a tile (0.5, 1.5, … 2999.5) × pixel_size
+    px_offsets = (np.arange(n) + 0.5) * _SIN_PIXEL_SIZE
+
+    # Full 1-D coordinate vectors across the composite grid
+    sin_x_1d = np.concatenate([orig + px_offsets for orig in x_tile_origins])
+    # y_tile_origins are in SIN (northward-positive); flip so row 0 = northernmost
+    sin_y_1d = np.concatenate(
+        [orig + px_offsets[::-1] for orig in y_tile_origins[::-1]]
+    )
+
+    # 2-D grids of SIN coordinates
+    sin_x_2d, sin_y_2d = np.meshgrid(sin_x_1d, sin_y_1d)
+    lon_2d, lat_2d = to_geo.transform(sin_x_2d, sin_y_2d)
+
+    # ------------------------------------------------------------------
+    # Step 3: compute tile name and within-tile pixel indices for every pixel.
+    # ------------------------------------------------------------------
+    # Global tile column / row for each composite pixel
+    tile_col = np.repeat(np.arange(n_tiles_x), n)  # shape (total_x,)
+    tile_row = np.repeat(np.arange(n_tiles_y), n)  # shape (total_y,)
+    tile_col_2d = np.broadcast_to(tile_col[np.newaxis, :], (total_y, total_x))
+    tile_row_2d = np.broadcast_to(tile_row[:, np.newaxis], (total_y, total_x))
+
+    h_2d = (h_min + tile_col_2d).astype(np.int16)
+    v_2d = (v_min + tile_row_2d).astype(np.int16)
+
+    # Within-tile pixel indices (xi = column within tile, yi = row within tile)
+    xi_local = np.tile(np.arange(n, dtype=np.int16), n_tiles_x)  # (total_x,)
+    yi_local = np.tile(np.arange(n, dtype=np.int16), n_tiles_y)  # (total_y,)
+    xi_2d = np.broadcast_to(xi_local[np.newaxis, :], (total_y, total_x))
+    yi_2d = np.broadcast_to(yi_local[:, np.newaxis], (total_y, total_x))
+
+    # Tile name strings: "hHHvVV"
+    tile_names = np.array(
+        [f"h{h:02d}v{v:02d}" for v, h in np.ndindex(n_tiles_y, n_tiles_x)],
+        dtype="U8",
+    ).reshape(n_tiles_y, n_tiles_x)
+    tile_block = np.repeat(np.repeat(tile_names, n, axis=0), n, axis=1)
+
+    # ------------------------------------------------------------------
+    # Step 4: mask pixels outside the bbox.
+    # ------------------------------------------------------------------
+    in_domain = (
+        (lon_2d >= lon_min)
+        & (lon_2d <= lon_max)
+        & (lat_2d >= lat_min)
+        & (lat_2d <= lat_max)
+    )
+
+    ds = xr.Dataset(
+        {
+            "tile": (["y", "x"], np.where(in_domain, tile_block, "")),
+            "tile_xi": (["y", "x"], np.where(in_domain, xi_2d, -1).astype(np.int16)),
+            "tile_yi": (["y", "x"], np.where(in_domain, yi_2d, -1).astype(np.int16)),
+        },
+        coords={
+            "sin_x": (["x"], sin_x_1d),
+            "sin_y": (["y"], sin_y_1d),
+            "lon": (["y", "x"], lon_2d.astype(np.float32)),
+            "lat": (["y", "x"], lat_2d.astype(np.float32)),
+        },
+        attrs={
+            "bbox_lon_min": lon_min,
+            "bbox_lat_min": lat_min,
+            "bbox_lon_max": lon_max,
+            "bbox_lat_max": lat_max,
+            "buffer_deg": buffer_deg,
+            "h_min": h_min,
+            "h_max": h_max,
+            "v_min": v_min,
+            "v_max": v_max,
+        },
+    )
+    n_valid = int(in_domain.sum())
+    log.info("Domain mapping: %d / %d pixels within domain", n_valid, total_x * total_y)
+    return ds
+
+
 def _sin_to_lonlat(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Convert MODIS SIN projection coordinates (metres) to lon/lat (degrees).
 

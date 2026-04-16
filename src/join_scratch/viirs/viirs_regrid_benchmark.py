@@ -26,6 +26,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import re
+
 from join_scratch.amsr2.amsr2_regrid import build_lis_area_definition
 from join_scratch.storage import (
     StorageConfig,
@@ -35,6 +37,8 @@ from join_scratch.storage import (
 from join_scratch.viirs.viirs_regrid import (
     SATPY_CACHE,
     VIIRS_GLOB,
+    _lis_lonlat_bounds,
+    build_viirs_domain_mapping,
     build_viirs_swath_definition,
     filter_tiles_by_domain,
     load_viirs_tiles,
@@ -146,7 +150,14 @@ def bench_bucket_avg(tile: dict, source_def, target_def) -> BenchmarkResult:
 # ---------------------------------------------------------------------------
 
 
-def render_report(results: list[BenchmarkResult]) -> str:
+def render_report(
+    results: list[BenchmarkResult],
+    mapping_elapsed_s: float,
+    mapping_shape: tuple[int, int],
+    mapping_n_valid: int,
+    date_key: str,
+    n_tiles: int,
+) -> str:
     col_w = (28, 18, 10, 16, 40)
     header = (
         f"{'Method':<{col_w[0]}} {'Source shape':<{col_w[1]}} "
@@ -158,6 +169,9 @@ def render_report(results: list[BenchmarkResult]) -> str:
     lines = [
         "VIIRS Regridding Benchmark",
         "==========================",
+        "",
+        f"Date:        {date_key}",
+        f"Tiles loaded: {n_tiles}",
         "",
         "Algorithms compared (all via satpy):",
         "  nearest (cold/warm)  : satpy KDTreeResampler nearest-neighbour",
@@ -174,6 +188,11 @@ def render_report(results: list[BenchmarkResult]) -> str:
         "Caching notes:",
         "  nearest/bilinear write zarr files to _data/viirs/satpy-cache/",
         "  EWA and BucketAvg have no precomputed index structures to cache",
+        "",
+        "--- Domain mapping (build_viirs_domain_mapping) ---",
+        f"  Grid shape : {mapping_shape[0]} rows × {mapping_shape[1]} cols",
+        f"  Valid pixels: {mapping_n_valid:,}",
+        f"  Elapsed    : {mapping_elapsed_s:.3f} s",
         "",
         header,
         sep,
@@ -199,23 +218,69 @@ def render_report(results: list[BenchmarkResult]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark VIIRS regridding methods.")
     add_storage_args(parser)
+    parser.add_argument(
+        "--date",
+        default=None,
+        help=(
+            "Process only this date key (e.g. 'A2019001').  "
+            "Defaults to the first date found in the glob results."
+        ),
+    )
     args = parser.parse_args()
     storage = storage_config_from_namespace(args)
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # --- Build LIS area and domain mapping (timed) ---
+    lis_area = build_lis_area_definition(storage)
+    lon_min, lat_min, lon_max, lat_max = _lis_lonlat_bounds(lis_area)
+
+    log.info("Building VIIRS domain mapping …")
+    t0 = time.perf_counter()
+    mapping = build_viirs_domain_mapping((lon_min, lat_min, lon_max, lat_max))
+    mapping_elapsed_s = time.perf_counter() - t0
+    mapping_shape = (mapping.dims["y"], mapping.dims["x"])
+    mapping_n_valid = int((mapping["tile"] != "").values.sum())
+    log.info(
+        "Domain mapping built in %.3f s (%d×%d grid, %d valid pixels)",
+        mapping_elapsed_s,
+        mapping_shape[0],
+        mapping_shape[1],
+        mapping_n_valid,
+    )
+
+    # --- Glob and filter to LIS domain ---
     viirs_files = storage.glob(VIIRS_GLOB)
     if not viirs_files:
         raise FileNotFoundError(f"No VIIRS files found with glob {VIIRS_GLOB!r}")
 
-    lis_area = build_lis_area_definition(storage)
     log.info("Found %d VIIRS file(s); filtering to LIS domain …", len(viirs_files))
     viirs_files = filter_tiles_by_domain(viirs_files, lis_area)
     if not viirs_files:
         raise FileNotFoundError("No VIIRS tiles overlap the LIS domain.")
 
-    log.info("Loading data …")
-    tile = load_viirs_tiles(viirs_files, storage)
+    # --- Group by date, pick one day ---
+    _hv_date_re = re.compile(r"\.(A\d{7})\.")
+    date_groups: dict[str, list[str]] = {}
+    for path in viirs_files:
+        m = _hv_date_re.search(path)
+        if m:
+            date_groups.setdefault(m.group(1), []).append(path)
+
+    if args.date:
+        if args.date not in date_groups:
+            raise ValueError(
+                f"Date {args.date!r} not found. Available: {sorted(date_groups)}"
+            )
+        date_key = args.date
+    else:
+        date_key = sorted(date_groups)[0]
+
+    day_files = date_groups[date_key]
+    log.info("Benchmarking date %s (%d tile(s)) …", date_key, len(day_files))
+
+    # --- Load tiles and build swath ---
+    tile = load_viirs_tiles(day_files, storage)
     source_def = build_viirs_swath_definition(tile)
 
     # Temporary cache dir — always start cold for the benchmark
@@ -247,7 +312,14 @@ def main() -> None:
     finally:
         shutil.rmtree(bench_cache, ignore_errors=True)
 
-    report = render_report(results)
+    report = render_report(
+        results,
+        mapping_elapsed_s=mapping_elapsed_s,
+        mapping_shape=mapping_shape,
+        mapping_n_valid=mapping_n_valid,
+        date_key=date_key,
+        n_tiles=len(day_files),
+    )
     print(report)
 
     report_path = REPORTS_DIR / "viirs_regrid_benchmark.txt"
