@@ -559,29 +559,28 @@ def load_viirs_tiles_subset(
         xi = xi_flat[mask].astype(np.intp)
         yi = yi_flat[mask].astype(np.intp)
 
-        # h5py fancy indexing requires indices in strictly increasing order.
-        # Sort by (yi, xi) in row-major order and apply the same permutation
-        # to the lon/lat arrays so they stay aligned.
-        sort_order = np.lexsort((xi, yi))
-        xi_sorted = xi[sort_order]
-        yi_sorted = yi[sort_order]
-
         log.info("Loading VIIRS tile %s (%d domain pixels)", path, len(xi))
         if not stem:
             stem = path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
+        # h5py fancy (point) indexing requires each dimension to be independently
+        # in increasing order, which scattered (yi, xi) pairs don't satisfy.
+        # Read only the bounding-box rows as a contiguous 2-D slice, then use
+        # numpy fancy indexing (no such restriction) to extract the exact pixels.
+        yi_min, yi_max = int(yi.min()), int(yi.max())
         with storage.open(path) as fobj:
             with h5py.File(fobj, "r") as f:
-                raw = f[_HDFEOS_DATA_PATH][yi_sorted, xi_sorted]  # uint8 (N_tile,)
+                slab = f[_HDFEOS_DATA_PATH][
+                    yi_min : yi_max + 1, :
+                ]  # uint8 (rows, 3000)
+        raw = slab[yi - yi_min, xi]  # numpy fancy index — no ordering constraint
 
         data = raw.astype(np.float32)
         data[data > 100] = np.nan
 
         all_data.append(data)
-        lon_mask = lon_flat[mask]
-        lat_mask = lat_flat[mask]
-        all_lon.append(lon_mask[sort_order].astype(np.float64))
-        all_lat.append(lat_mask[sort_order].astype(np.float64))
+        all_lon.append(lon_flat[mask].astype(np.float64))
+        all_lat.append(lat_flat[mask].astype(np.float64))
 
     if not all_data:
         raise ValueError(
