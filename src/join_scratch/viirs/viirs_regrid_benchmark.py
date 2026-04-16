@@ -41,7 +41,7 @@ from join_scratch.viirs.viirs_regrid import (
     build_viirs_domain_mapping,
     build_viirs_swath_definition,
     filter_tiles_by_domain,
-    load_viirs_tiles,
+    load_viirs_tiles_subset,
     regrid_bilinear,
     regrid_bucket_avg,
     regrid_ewa,
@@ -239,7 +239,7 @@ def main() -> None:
     t0 = time.perf_counter()
     mapping = build_viirs_domain_mapping((lon_min, lat_min, lon_max, lat_max))
     mapping_elapsed_s = time.perf_counter() - t0
-    mapping_shape = (mapping.dims["y"], mapping.dims["x"])
+    mapping_shape = (mapping.sizes["y"], mapping.sizes["x"])
     mapping_n_valid = int((mapping["tile"] != "").values.sum())
     log.info(
         "Domain mapping built in %.3f s (%d×%d grid, %d valid pixels)",
@@ -280,7 +280,8 @@ def main() -> None:
     log.info("Benchmarking date %s (%d tile(s)) …", date_key, len(day_files))
 
     # --- Load tiles and build swath ---
-    tile = load_viirs_tiles(day_files, storage)
+    # --- Load only domain pixels using the mapping ---
+    tile = load_viirs_tiles_subset(mapping, day_files, storage)
     source_def = build_viirs_swath_definition(tile)
 
     # Temporary cache dir — always start cold for the benchmark

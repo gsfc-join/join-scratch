@@ -468,6 +468,110 @@ def load_viirs_tile(path: str, storage: StorageConfig) -> dict:
     }
 
 
+def load_viirs_tiles_subset(
+    mapping: xr.Dataset,
+    paths: list[str],
+    storage: StorageConfig,
+) -> dict:
+    """Load VIIRS tile data for only the pixels that fall within the domain.
+
+    Uses the pre-computed *mapping* (from :func:`build_viirs_domain_mapping`)
+    to determine exactly which pixels to read from each tile.  No lon/lat
+    computation is needed — coordinates come directly from the mapping.
+
+    For each tile in *paths* the function:
+
+    1. Looks up all mapping pixels whose ``tile`` variable matches the tile's
+       ``hXXvYY`` identifier.
+    2. Reads those pixels from the HDF5 by integer-indexing into ``raw[yi, xi]``
+       — so only domain pixels are loaded from S3, no full 3000×3000 array is
+       kept in memory.
+    3. Collects the corresponding lon/lat values from the mapping.
+
+    The result is a flat ``(N, 1)`` shaped dict suitable for passing to satpy
+    resamplers (which require at least 2-D arrays).
+
+    Parameters
+    ----------
+    mapping:
+        Dataset returned by :func:`build_viirs_domain_mapping`.
+    paths:
+        Paths to VIIRS HDF5 tiles (may be a subset of all tiles).
+    storage:
+        Storage configuration for file access.
+
+    Returns
+    -------
+    dict with keys:
+
+    - ``data``  : float32 (N, 1) — VIIRS data values for domain pixels
+    - ``lon2d`` : float64 (N, 1) — pixel-centre longitudes
+    - ``lat2d`` : float64 (N, 1) — pixel-centre latitudes
+    - ``stem``  : str, derived from the first tile's date component
+    """
+    import re as _re
+
+    _hv_re = _re.compile(r"\.(h\d{2}v\d{2})\.")
+
+    # Pre-flatten mapping arrays once — avoids repeated 2-D indexing
+    tile_flat = mapping["tile"].values.ravel()  # (total_y * total_x,)
+    xi_flat = mapping["tile_xi"].values.ravel()  # int16
+    yi_flat = mapping["tile_yi"].values.ravel()  # int16
+    lon_flat = mapping.coords["lon"].values.ravel()  # float32
+    lat_flat = mapping.coords["lat"].values.ravel()  # float32
+
+    all_data: list[np.ndarray] = []
+    all_lon: list[np.ndarray] = []
+    all_lat: list[np.ndarray] = []
+    stem: str = ""
+
+    for path in paths:
+        m = _hv_re.search(path)
+        if m is None:
+            log.warning("Cannot parse hXXvYY from %s; skipping", path)
+            continue
+        hv = m.group(1)  # e.g. "h10v04"
+
+        # Find mapping pixels belonging to this tile
+        mask = tile_flat == hv
+        if not mask.any():
+            log.debug("No domain pixels for tile %s; skipping", hv)
+            continue
+
+        xi = xi_flat[mask].astype(np.intp)
+        yi = yi_flat[mask].astype(np.intp)
+
+        log.info("Loading VIIRS tile %s (%d domain pixels)", path, len(xi))
+        if not stem:
+            stem = path.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+        with storage.open(path) as fobj:
+            with h5py.File(fobj, "r") as f:
+                raw = f[_HDFEOS_DATA_PATH][yi, xi]  # uint8 (N_tile,)
+
+        data = raw.astype(np.float32)
+        data[data > 100] = np.nan
+
+        all_data.append(data)
+        all_lon.append(lon_flat[mask].astype(np.float64))
+        all_lat.append(lat_flat[mask].astype(np.float64))
+
+    if not all_data:
+        raise ValueError("No domain pixels found in any of the provided tile paths.")
+
+    data_1d = np.concatenate(all_data)  # (N,)
+    lon_1d = np.concatenate(all_lon)  # (N,)
+    lat_1d = np.concatenate(all_lat)  # (N,)
+
+    # Reshape to (N, 1) so satpy resamplers (which expect 2-D dims) work
+    return {
+        "data": data_1d[:, np.newaxis],
+        "lon2d": lon_1d[:, np.newaxis],
+        "lat2d": lat_1d[:, np.newaxis],
+        "stem": stem,
+    }
+
+
 def load_viirs_tiles(paths: list[str], storage: StorageConfig) -> dict:
     """Load and composite multiple VIIRS tiles into a single swath.
 
