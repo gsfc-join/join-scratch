@@ -24,6 +24,8 @@ join_scratch = { path = ".", editable = true }
 bench_amsr2 = "python3 src/join_scratch/amsr2/amsr2_regrid_benchmark.py"
 bench_viirs = "python3 src/join_scratch/viirs/viirs_regrid_benchmark.py"
 bench_ceda = "python3 src/join_scratch/ceda/ceda_regrid_benchmark.py"
+icesat2 = "python3 -m join_scratch.icesat2.atl06_regrid"
+viz_icesat2 = "python3 -m join_scratch.icesat2.atl06_visualize"
 
 [tool.pixi.dependencies]
 python = ">=3.14.4,<3.15"
@@ -38,6 +40,8 @@ pyresample = ">=1.35.0,<2"
 dask = ">=2026.3.0,<2027"
 zarr = ">=3.1.6,<4"
 satpy = ">=0.60.0,<0.61"
+sliderule = ">=5.3.1,<6"
+cartopy = ">=0.25.0,<0.26"
 
 [tool.pixi.feature.dev.dependencies]
 ipython = "*"

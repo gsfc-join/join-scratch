@@ -2,6 +2,7 @@
 .pixi/*
 !.pixi/config.toml
 
+/_data-raw
 /_data-raw/
 /_data/
 /_reports/
