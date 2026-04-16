@@ -122,24 +122,33 @@ def _lis_lonlat_bounds(area: AreaDefinition) -> tuple[float, float, float, float
     return float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())
 
 
-def _tile_lonlat_bbox(
-    path: str, storage: "StorageConfig"
-) -> tuple[float, float, float, float]:
-    """Return (lon_min, lat_min, lon_max, lat_max) for a VIIRS tile.
+def _sin_tile_lonlat_bbox(h: int, v: int) -> tuple[float, float, float, float]:
+    """Return (lon_min, lat_min, lon_max, lat_max) for a MODIS/VIIRS SIN tile.
 
-    Reads only the lightweight 1-D XDim/YDim coordinate vectors (3000 floats
-    each, ~48 KB total) and transforms the four extreme corners to lon/lat.
-    This avoids loading the 3000×3000 data array just to check overlap.
+    Tile bounds are computed purely from (h, v) indices using the MODIS SIN
+    grid geometry — no file I/O required.  See docs/VIIRS.md for the math.
+
+    The MODIS SIN grid divides the globe into 36×18 tiles.  Each tile spans
+    exactly 10° of latitude (tile_height_y = pi*R/18) and the same distance
+    in metres along the x-axis (tile_width_x = 2*pi*R/36).
+
+    Lon bounds are computed at both the southern and northern latitude edges
+    because the sinusoidal projection compresses x by cos(lat); the actual
+    extreme longitudes depend on which latitude edge is closer to the equator.
     """
-    with storage.open(path) as fobj:
-        with h5py.File(fobj, "r") as f:
-            x_coords = f[_HDFEOS_XDIM_PATH][:]
-            y_coords = f[_HDFEOS_YDIM_PATH][:]
+    R = 6371007.181  # MODIS sphere radius (metres)
+    tile_w = 2 * np.pi * R / 36  # ≈ 1,111,950 m
+    tile_h = np.pi * R / 18  # ≈ 1,111,950 m
 
-    # The four corners of the tile bounding box in SIN projection
-    corners_x = np.array([x_coords[0], x_coords[-1], x_coords[-1], x_coords[0]])
-    corners_y = np.array([y_coords[0], y_coords[0], y_coords[-1], y_coords[-1]])
+    x_min = (h - 18) * tile_w
+    x_max = x_min + tile_w
+    y_min = (9 - v - 1) * tile_h  # y increases northward; v increases southward
+    y_max = y_min + tile_h
+
     transformer = pyproj.Transformer.from_crs(_SIN_CRS, "EPSG:4326", always_xy=True)
+    # Evaluate lon at all four corners; lon extremes depend on lat (cos compression)
+    corners_x = np.array([x_min, x_max, x_max, x_min])
+    corners_y = np.array([y_min, y_min, y_max, y_max])
     lons, lats = transformer.transform(corners_x, corners_y)
     return float(lons.min()), float(lats.min()), float(lons.max()), float(lats.max())
 
@@ -147,13 +156,12 @@ def _tile_lonlat_bbox(
 def filter_tiles_by_domain(
     paths: list[str],
     area: AreaDefinition,
-    storage: "StorageConfig",
     buffer_deg: float = DOMAIN_FILTER_BUFFER_DEG,
 ) -> list[str]:
     """Return only the tiles whose bounding box overlaps the LIS domain.
 
-    For each tile only the 1-D coordinate vectors are read (not the data
-    array), so this is cheap even for thousands of files.
+    Tile bounds are derived purely from the ``hXXvYY`` tile index encoded in
+    each filename using the MODIS SIN grid geometry — no file I/O is needed.
 
     Parameters
     ----------
@@ -161,8 +169,6 @@ def filter_tiles_by_domain(
         List of VIIRS tile paths as returned by ``StorageConfig.glob``.
     area:
         The target pyresample ``AreaDefinition`` (LIS domain).
-    storage:
-        Storage config used to open files.
     buffer_deg:
         Extra margin added to the LIS domain bounding box on all sides
         (degrees).  Ensures tiles that only partially overlap the domain
@@ -174,6 +180,8 @@ def filter_tiles_by_domain(
         Subset of *paths* that overlap (or are within *buffer_deg* of) the
         LIS domain.
     """
+    import re
+
     lon_min, lat_min, lon_max, lat_max = _lis_lonlat_bounds(area)
     lon_min -= buffer_deg
     lat_min -= buffer_deg
@@ -189,10 +197,17 @@ def filter_tiles_by_domain(
         lat_max,
     )
 
+    _hv_re = re.compile(r"\.h(\d{2})v(\d{2})\.")
     kept: list[str] = []
     skipped = 0
     for path in paths:
-        t_lon_min, t_lat_min, t_lon_max, t_lat_max = _tile_lonlat_bbox(path, storage)
+        m = _hv_re.search(path)
+        if m is None:
+            log.warning("Cannot parse hXXvYY from path, including by default: %s", path)
+            kept.append(path)
+            continue
+        h, v = int(m.group(1)), int(m.group(2))
+        t_lon_min, t_lat_min, t_lon_max, t_lat_max = _sin_tile_lonlat_bbox(h, v)
         overlaps = (
             t_lon_max >= lon_min
             and t_lon_min <= lon_max
@@ -203,7 +218,7 @@ def filter_tiles_by_domain(
             kept.append(path)
         else:
             skipped += 1
-            log.debug("Skipping tile outside domain: %s", path)
+            log.debug("Skipping tile h%02dv%02d (outside domain): %s", h, v, path)
 
     log.info(
         "Tile filter: %d / %d tiles overlap the LIS domain (%d skipped)",
@@ -464,7 +479,7 @@ def main() -> None:
     lis_lons, lis_lats = lis_area.get_lonlats()
 
     log.info("Filtering tiles to LIS domain …")
-    viirs_files = filter_tiles_by_domain(viirs_files, lis_area, storage)
+    viirs_files = filter_tiles_by_domain(viirs_files, lis_area)
     if not viirs_files:
         raise FileNotFoundError("No VIIRS tiles overlap the LIS domain.")
 

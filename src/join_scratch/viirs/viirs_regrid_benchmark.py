@@ -210,7 +210,7 @@ def main() -> None:
 
     lis_area = build_lis_area_definition(storage)
     log.info("Found %d VIIRS file(s); filtering to LIS domain …", len(viirs_files))
-    viirs_files = filter_tiles_by_domain(viirs_files, lis_area, storage)
+    viirs_files = filter_tiles_by_domain(viirs_files, lis_area)
     if not viirs_files:
         raise FileNotFoundError("No VIIRS tiles overlap the LIS domain.")
 
