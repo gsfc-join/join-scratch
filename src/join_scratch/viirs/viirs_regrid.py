@@ -208,6 +208,21 @@ def filter_tiles_by_domain(
             continue
         h, v = int(m.group(1)), int(m.group(2))
         t_lon_min, t_lat_min, t_lon_max, t_lat_max = _sin_tile_lonlat_bbox(h, v)
+        # Tiles near the antimeridian or poles can produce lon spans > 180°
+        # (i.e. the tile wraps).  Treat such tiles conservatively: if their
+        # lon span exceeds 180° they are not genuinely within any compact
+        # mid-latitude domain, so skip them.
+        lon_span = t_lon_max - t_lon_min
+        if lon_span > 180.0:
+            skipped += 1
+            log.debug(
+                "Skipping tile h%02dv%02d (antimeridian-crossing, lon span %.0f°): %s",
+                h,
+                v,
+                lon_span,
+                path,
+            )
+            continue
         overlaps = (
             t_lon_max >= lon_min
             and t_lon_min <= lon_max
@@ -557,7 +572,10 @@ def load_viirs_tiles_subset(
         all_lat.append(lat_flat[mask].astype(np.float64))
 
     if not all_data:
-        raise ValueError("No domain pixels found in any of the provided tile paths.")
+        raise ValueError(
+            "No domain pixels found in any of the provided tile paths. "
+            "Check that the mapping bbox overlaps the tile set."
+        )
 
     data_1d = np.concatenate(all_data)  # (N,)
     lon_1d = np.concatenate(all_lon)  # (N,)
