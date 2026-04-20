@@ -44,7 +44,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark ICESat-2 ATL06 fetch + regridding to the LIS model grid."
     )
-    parser.add_argument("--lis-path", required=True, type=Path)
+    parser.add_argument(
+        "--lis-path",
+        default=f"s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc",
+        help="Local path or s3:// URI to the LIS NetCDF file.",
+    )
     parser.add_argument(
         "--cache-path",
         type=Path,

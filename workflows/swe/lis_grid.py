@@ -12,6 +12,35 @@ log = logging.getLogger(__name__)
 LIS_RELPATH = "lis_input_NMP_1000m_missouri.nc"
 
 
+def _open_lis_ds(path, fs=None) -> xr.Dataset:
+    """Open a LIS NetCDF as an xarray Dataset, supporting S3 URIs via obstore.
+
+    Parameters
+    ----------
+    path:
+        Local path or ``s3://`` URI to the LIS NetCDF file.
+    fs:
+        Optional obstore ``FsspecStore`` (or any fsspec-compatible object).
+        If *None* and *path* starts with ``s3://``, one is created automatically
+        via :func:`s3_utils.make_fs`.  If *None* and path is local, opens
+        directly.
+    """
+    path_str = str(path)
+    if path_str.startswith("s3://"):
+        if fs is None:
+            from s3_utils import make_fs
+            fs = make_fs()
+        fobj = fs.open(path_str)
+        ds = xr.open_dataset(fobj, engine="h5netcdf")
+    elif fs is not None:
+        from satpy.readers.core.remote import FSFile
+        f = FSFile(path_str, fs=fs)
+        ds = xr.open_dataset(f, engine="h5netcdf")
+    else:
+        ds = xr.open_dataset(path_str, engine="h5netcdf")
+    return ds
+
+
 def load_lis_grid(path: Path | str, fs=None) -> xr.Dataset:
     """Load the LIS input file and return a dataset with lat/lon/lat_b/lon_b.
 
@@ -23,19 +52,13 @@ def load_lis_grid(path: Path | str, fs=None) -> xr.Dataset:
     Parameters
     ----------
     path:
-        Path to the LIS input NetCDF file.
+        Local path or ``s3://`` URI to the LIS input NetCDF file.
     fs:
-        Optional fsspec filesystem object.  If provided, opens via FSFile.
-        If None, opens locally.
+        Optional obstore ``FsspecStore``.  If *None* and *path* is an S3 URI,
+        a store is created automatically.
     """
     log.info("Loading LIS grid from %s", path)
-    if fs is not None:
-        from satpy.readers.core.remote import FSFile
-
-        f = FSFile(path, fs=fs)
-        ds = xr.open_dataset(f, engine="h5netcdf")
-    else:
-        ds = xr.open_dataset(path, engine="h5netcdf")
+    ds = _open_lis_ds(path, fs=fs)
 
     ds = ds[["lat", "lon", "lat_b", "lon_b"]]
     ds = ds.isel(
@@ -58,19 +81,13 @@ def build_lis_area_definition(path: Path | str, fs=None) -> AreaDefinition:
     Parameters
     ----------
     path:
-        Path to the LIS input NetCDF file.
+        Local path or ``s3://`` URI to the LIS input NetCDF file.
     fs:
-        Optional fsspec filesystem object.  If provided, opens via FSFile.
-        If None, opens locally.
+        Optional obstore ``FsspecStore``.  If *None* and *path* is an S3 URI,
+        a store is created automatically.
     """
     log.info("Building LIS AreaDefinition from %s", path)
-    if fs is not None:
-        from satpy.readers.core.remote import FSFile
-
-        f = FSFile(path, fs=fs)
-        ds = xr.open_dataset(f, engine="h5netcdf")
-    else:
-        ds = xr.open_dataset(path, engine="h5netcdf")
+    ds = _open_lis_ds(path, fs=fs)
     ds.load()
 
     attrs = ds.attrs
