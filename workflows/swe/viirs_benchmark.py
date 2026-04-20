@@ -54,6 +54,13 @@ def main() -> None:
         help="Directory to write timestamped report file (default: print to stdout only)",
     )
     parser.add_argument(
+        "--max-tiles",
+        type=int,
+        default=20,
+        help="Maximum number of VIIRS tiles to load per date (default: 20). "
+             "Use 0 for no limit (loads all tiles, may require large memory).",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         default=False,
@@ -88,6 +95,8 @@ def main() -> None:
             date_key = parts[1] if len(parts) > 1 else fname
             date_groups[date_key].append(key)
         date_key, group_keys = next(iter(sorted(date_groups.items())))
+        if ns.max_tiles and len(group_keys) > ns.max_tiles:
+            group_keys = group_keys[: ns.max_tiles]
         log.info("Benchmarking on date %s (%d tile(s))", date_key, len(group_keys))
         handlers = [
             handler_from_s3(
@@ -108,6 +117,8 @@ def main() -> None:
             date_key = parts[1] if len(parts) > 1 else p.stem
             date_groups_local[date_key].append(p)
         date_key, local_paths = next(iter(sorted(date_groups_local.items())))
+        if ns.max_tiles and len(local_paths) > ns.max_tiles:
+            local_paths = local_paths[: ns.max_tiles]
         log.info("Benchmarking on date %s (%d tile(s))", date_key, len(local_paths))
         handlers = [ViirsFileHandler.from_path(p) for p in local_paths]
 
