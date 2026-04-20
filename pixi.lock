@@ -3408,7 +3408,7 @@ packages:
 - pypi: ./
   name: join-scratch
   version: 0.1.0
-  sha256: 86165b95e81dbb5383f8cbf3b5cb33fc4fedf2f540dfb274b591743c190c7b57
+  sha256: af40946bd6062d4c2d89d2180235c393deeb317cd8185ab5d7b679eda03f6a22
   requires_python: '>=3.11'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/json-c-0.18-h6688a6e_0.conda
   sha256: 09e706cb388d3ea977fabcee8e28384bdaad8ce1fc49340df5f868a2bd95a7da

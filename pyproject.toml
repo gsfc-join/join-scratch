@@ -10,8 +10,8 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [tool.pyright]
-venvPath = "."
-venv = ".pixi/envs/default"
+venvPath = ".pixi/envs"
+venv = "default"
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
