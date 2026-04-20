@@ -3408,7 +3408,9 @@ packages:
 - pypi: ./
   name: join-scratch
   version: 0.1.0
-  sha256: af40946bd6062d4c2d89d2180235c393deeb317cd8185ab5d7b679eda03f6a22
+  sha256: 0d790d4771f79e6f65ae8da16603fc77a1612bdd4f7cc2adaac4e2da57ff284b
+  requires_dist:
+  - cartopy>=0.25.0
   requires_python: '>=3.11'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/json-c-0.18-h6688a6e_0.conda
   sha256: 09e706cb388d3ea977fabcee8e28384bdaad8ce1fc49340df5f868a2bd95a7da
