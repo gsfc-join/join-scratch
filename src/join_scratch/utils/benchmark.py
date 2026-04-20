@@ -4,6 +4,7 @@ import gc
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
 def _rss_mib() -> float:
@@ -57,9 +58,26 @@ def _time_call(fn, *args, **kwargs) -> tuple[float, float]:
 
 
 def render_report(
-    results: list[BenchmarkResult], title: str = "Benchmark Report"
+    results: list[BenchmarkResult],
+    title: str = "Benchmark Report",
+    timestamp: datetime | None = None,
 ) -> str:
-    """Format a plain-text benchmark table."""
+    """Format a plain-text benchmark table.
+
+    Parameters
+    ----------
+    results:
+        List of benchmark results to include in the report.
+    title:
+        Title line of the report.
+    timestamp:
+        Datetime to embed in the report header.  Defaults to the current UTC
+        time when the function is called.
+    """
+    if timestamp is None:
+        timestamp = datetime.now(tz=timezone.utc)
+    ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     col_w = (28, 18, 10, 16, 40)
     header = (
         f"{'Method':<{col_w[0]}} {'Source shape':<{col_w[1]}} "
@@ -71,6 +89,7 @@ def render_report(
     lines = [
         title,
         "=" * len(title),
+        f"Timestamp: {ts_str}",
         "",
         header,
         sep,

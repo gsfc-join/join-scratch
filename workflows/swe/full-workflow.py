@@ -1,0 +1,349 @@
+#!/usr/bin/env python
+"""Full SWE workflow: regrid all input datasets to the LIS grid and combine.
+
+Regrids each of the following datasets onto the LIS 1 km Lambert Conformal grid
+and writes all outputs into a single NetCDF file with informatively named variables:
+
+  Dataset              Variable(s)           Default method    Output variable(s)
+  ─────────────────────────────────────────────────────────────────────────────────
+  AMSR2 snow depth     Geophysical Data[0]   bilinear          amsr2_snow_depth_mean
+                       Geophysical Data[1]   bilinear          amsr2_snow_depth_uncertainty
+  CEDA ESA CCI SWE     swe                   bilinear          ceda_swe
+                       swe_std               bilinear          ceda_swe_std
+  VIIRS CGF snow cover CGF_NDSI_Snow_Cover   nearest           viirs_cgf_ndsi_snow_cover
+  ICESat-2 ATL06       h_li                  mean              icesat2_h_li
+
+For AMSR2 ``inner`` dimension (phony_dim_2): index 0 = ascending-pass mean value,
+index 1 = descending-pass uncertainty, per dataset documentation.
+
+Usage example
+─────────────
+    python full-workflow.py \\
+        --lis-path /data/lis_input_NMP_1000m_missouri.nc \\
+        --amsr2-dir /data/amsr2 \\
+        --ceda-dir  /data/ceda \\
+        --viirs-dir /data/viirs \\
+        --icesat2-parquet /data/icesat2/atl06.parquet \\
+        --output-path /data/swe_combined.nc
+"""
+
+import sys
+import argparse
+import logging
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import xarray as xr
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from join_scratch.datasets import Amsr2FileHandler, CedaFileHandler, Icesat2FileHandler, ViirsFileHandler
+from join_scratch.regrid import regrid
+from join_scratch.regrid.regular_to_regular import compute_weights, load_regridder
+from lis_grid import build_lis_area_definition, load_lis_grid
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+AMSR2_GLOB = "**/*.h5"
+CEDA_GLOB = "**/*.nc"
+VIIRS_GLOB = "**/*.h5"
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _regrid_amsr2(
+    input_dir: Path,
+    lis_grid: xr.Dataset,
+    method: str,
+    weights_dir: Path,
+) -> dict[str, xr.DataArray]:
+    """Regrid the first AMSR2 file found and return {var_name: DataArray}."""
+    files = sorted(input_dir.glob(AMSR2_GLOB))
+    if not files:
+        log.warning("No AMSR2 files found under %s — skipping", input_dir)
+        return {}
+    path = files[0]
+    log.info("AMSR2: using %s", path.name)
+
+    handler = Amsr2FileHandler.from_path(path)
+    lat_asc = np.sort(handler._lat)
+    lon_asc = np.sort(handler._lon)
+    source_grid = xr.Dataset(coords={"lat": lat_asc, "lon": lon_asc})
+
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    weights_path = weights_dir / f"amsr2-lis-weights-{method}.nc"
+    compute_weights(source_grid, lis_grid, weights_path, method=method)
+    regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
+
+    da = handler.get_dataset().rename({"y": "lat", "x": "lon"}).sortby("lat")
+
+    # AMSR2 inner dim: index 0 = mean, index 1 = uncertainty
+    da_mean  = da.isel(inner=0).drop_vars("inner", errors="ignore")
+    da_unc   = da.isel(inner=1).drop_vars("inner", errors="ignore")
+
+    ds_mean = da_mean.to_dataset(name="Geophysical Data")
+    ds_unc  = da_unc.to_dataset(name="Geophysical Data")
+
+    log.info("AMSR2: regridding mean (inner=0) …")
+    rg_mean = regridder(ds_mean)["Geophysical Data"]
+
+    log.info("AMSR2: regridding uncertainty (inner=1) …")
+    rg_unc  = regridder(ds_unc)["Geophysical Data"]
+
+    def _da(arr, long_name, units):
+        return xr.DataArray(
+            arr.values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={"long_name": long_name, "units": units, "source": path.name},
+        )
+
+    return {
+        "amsr2_snow_depth_mean": _da(
+            rg_mean,
+            "AMSR2 snow depth (ascending-pass mean)",
+            "mm",
+        ),
+        "amsr2_snow_depth_uncertainty": _da(
+            rg_unc,
+            "AMSR2 snow depth uncertainty (descending-pass value)",
+            "mm",
+        ),
+    }
+
+
+def _regrid_ceda(
+    input_dir: Path,
+    lis_grid: xr.Dataset,
+    method: str,
+    weights_dir: Path,
+) -> dict[str, xr.DataArray]:
+    """Regrid the first CEDA file found and return {var_name: DataArray}."""
+    files = sorted(input_dir.glob(CEDA_GLOB))
+    if not files:
+        log.warning("No CEDA files found under %s — skipping", input_dir)
+        return {}
+    path = files[0]
+    log.info("CEDA: using %s", path.name)
+
+    handler = CedaFileHandler.from_path(path)
+    ds = handler.get_dataset()
+
+    lat_vals = ds["lat"].values if "lat" in ds else ds["y"].values
+    lon_vals = ds["lon"].values if "lon" in ds else ds["x"].values
+    if lat_vals.ndim == 2:
+        lat_vals = lat_vals[:, 0]
+    if lon_vals.ndim == 2:
+        lon_vals = lon_vals[0, :]
+    source_grid = xr.Dataset(
+        coords={"lat": np.sort(np.unique(lat_vals)), "lon": np.sort(np.unique(lon_vals))}
+    )
+
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    weights_path = weights_dir / f"ceda-lis-weights-{method}.nc"
+    compute_weights(source_grid, lis_grid, weights_path, method=method)
+    regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
+
+    # Restore lat/lon as dim names for xESMF
+    ds_xesmf = ds.swap_dims({"y": "lat", "x": "lon"})
+
+    log.info("CEDA: regridding swe and swe_std …")
+    rg = regridder(ds_xesmf)
+
+    def _da(arr, long_name, units):
+        return xr.DataArray(
+            arr.values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={"long_name": long_name, "units": units, "source": path.name},
+        )
+
+    return {
+        "ceda_swe": _da(rg["swe"], "CEDA ESA CCI snow water equivalent", "mm"),
+        "ceda_swe_std": _da(rg["swe_std"], "CEDA ESA CCI SWE standard deviation", "mm"),
+    }
+
+
+def _regrid_viirs(
+    input_dir: Path,
+    lis_area,
+    method: str,
+) -> dict[str, xr.DataArray]:
+    """Regrid the first VIIRS date group found and return {var_name: DataArray}."""
+    from pyresample.geometry import SwathDefinition
+
+    files = sorted(input_dir.glob(VIIRS_GLOB))
+    if not files:
+        log.warning("No VIIRS files found under %s — skipping", input_dir)
+        return {}
+
+    date_groups: dict[str, list[Path]] = defaultdict(list)
+    for p in files:
+        parts = p.stem.split(".")
+        date_key = parts[1] if len(parts) > 1 else p.stem
+        date_groups[date_key].append(p)
+
+    date_key, paths = next(iter(sorted(date_groups.items())))
+    log.info("VIIRS: using date %s (%d tile(s))", date_key, len(paths))
+
+    all_data, all_lons, all_lats = [], [], []
+    for path in paths:
+        handler = ViirsFileHandler.from_path(path)
+        da = handler.get_dataset()
+        swath_def = da.attrs["area"]
+        all_data.append(da.values)
+        all_lons.append(swath_def.lons.values)
+        all_lats.append(swath_def.lats.values)
+
+    composite_data = np.concatenate(all_data, axis=0)
+    composite_lons = np.concatenate(all_lons, axis=0)
+    composite_lats = np.concatenate(all_lats, axis=0)
+
+    lons_da = xr.DataArray(composite_lons, dims=["y", "x"])
+    lats_da = xr.DataArray(composite_lats, dims=["y", "x"])
+    source_def = SwathDefinition(lons=lons_da, lats=lats_da)
+    composite_da = xr.DataArray(composite_data, dims=["y", "x"])
+
+    log.info("VIIRS: regridding with method=%s …", method)
+    rg = regrid(composite_da, source_def, lis_area, method=method)
+
+    return {
+        "viirs_cgf_ndsi_snow_cover": xr.DataArray(
+            rg.values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={
+                "long_name": "VIIRS CGF NDSI snow cover",
+                "units": "1",
+                "source": f"date_key={date_key}",
+            },
+        )
+    }
+
+
+def _regrid_icesat2(
+    parquet_path: Path,
+    lis_area,
+    lis_grid: xr.Dataset,
+) -> dict[str, xr.DataArray]:
+    """Regrid ICESat-2 ATL06 point cloud and return {var_name: DataArray}."""
+    if not parquet_path.exists():
+        log.warning("ICESat-2 Parquet not found at %s — skipping", parquet_path)
+        return {}
+    log.info("ICESat-2: loading from %s", parquet_path)
+    handler = Icesat2FileHandler.from_path(parquet_path)
+    da = handler.get_dataset()
+    source_area = da.attrs["area"]
+    log.info("ICESat-2: regridding %d observations using mean …", len(da))
+    rg = regrid(da, source_area, lis_area, method="mean")
+    return {
+        "icesat2_h_li": xr.DataArray(
+            rg.values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={
+                "long_name": "ICESat-2 ATL06 land-ice surface height (mean per LIS pixel)",
+                "units": "meters",
+                "source": parquet_path.name,
+            },
+        )
+    }
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Regrid all SWE input datasets to the LIS grid and combine into "
+            "a single NetCDF file."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--lis-path", required=True, type=Path,
+                        help="Path to the LIS input NetCDF file.")
+    parser.add_argument("--amsr2-dir", type=Path, default=None,
+                        help="Directory containing AMSR2 HDF5 files.")
+    parser.add_argument("--ceda-dir", type=Path, default=None,
+                        help="Directory containing CEDA ESA CCI SWE NetCDF files.")
+    parser.add_argument("--viirs-dir", type=Path, default=None,
+                        help="Directory containing VIIRS CGF snow cover HDF5 files.")
+    parser.add_argument("--icesat2-parquet", type=Path, default=None,
+                        help="Path to the cached ICESat-2 ATL06 Parquet file.")
+    parser.add_argument("--weights-dir", type=Path, default=Path("_data/weights"),
+                        help="Directory for xESMF weights files.")
+    parser.add_argument("--output-path", type=Path,
+                        default=Path("_data/swe_combined.nc"),
+                        help="Output combined NetCDF path.")
+    # Per-dataset method overrides
+    parser.add_argument("--amsr2-method", default="bilinear",
+                        choices=["bilinear", "nearest_s2d", "conservative"],
+                        help="xESMF regridding method for AMSR2.")
+    parser.add_argument("--ceda-method", default="bilinear",
+                        choices=["bilinear", "nearest_s2d", "conservative"],
+                        help="xESMF regridding method for CEDA.")
+    parser.add_argument("--viirs-method", default="nearest",
+                        choices=["nearest", "bilinear", "ewa", "bucket_avg"],
+                        help="pyresample regridding method for VIIRS.")
+    ns = parser.parse_args()
+
+    lis_grid = load_lis_grid(ns.lis_path)
+    lis_area = build_lis_area_definition(ns.lis_path)
+
+    data_vars: dict[str, xr.DataArray] = {}
+
+    if ns.amsr2_dir is not None:
+        data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir))
+
+    if ns.ceda_dir is not None:
+        data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir))
+
+    if ns.viirs_dir is not None:
+        data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method))
+
+    if ns.icesat2_parquet is not None:
+        data_vars.update(_regrid_icesat2(ns.icesat2_parquet, lis_area, lis_grid))
+
+    if not data_vars:
+        log.error(
+            "No input directories provided or no data found. "
+            "Pass at least one of --amsr2-dir, --ceda-dir, --viirs-dir, --icesat2-parquet."
+        )
+        raise SystemExit(1)
+
+    # Build combined Dataset with shared LIS lat/lon coordinates
+    ds_out = xr.Dataset(
+        data_vars,
+        coords={
+            "lat": lis_grid["lat"],
+            "lon": lis_grid["lon"],
+        },
+        attrs={
+            "description": (
+                "Combined SWE and snow-cover observations regridded to the "
+                "LIS 1 km Lambert Conformal grid (Missouri/NMP domain)."
+            ),
+            "conventions": "CF-1.8",
+        },
+    )
+
+    encoding = {
+        var: {"dtype": "float32", "_FillValue": np.float32("nan")}
+        for var in data_vars
+    }
+
+    ns.output_path.parent.mkdir(parents=True, exist_ok=True)
+    log.info("Writing combined output to %s …", ns.output_path)
+    ds_out.to_netcdf(ns.output_path, engine="h5netcdf", encoding=encoding)
+    log.info("Done: %s", ns.output_path)
+
+    log.info("Variables written:")
+    for var in data_vars:
+        shape = data_vars[var].shape
+        log.info("  %-45s %s", var, shape)
+
+
+if __name__ == "__main__":
+    main()

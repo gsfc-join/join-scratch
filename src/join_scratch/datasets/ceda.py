@@ -64,15 +64,20 @@ class CedaFileHandler(JoinFileHandler):
         if "time" in ds.dims:
             ds = ds.squeeze("time", drop=True)
 
-        # Keep only required variables
-        ds = ds[CEDA_VARS + ["lat", "lon"]]
+        # Keep only required variables (lat/lon are dimension coords, not data vars)
+        ds = ds[CEDA_VARS]
 
         # Mask flag values (< 0) to NaN
         for var in CEDA_VARS:
             ds[var] = ds[var].where(ds[var] >= 0).astype(np.float32)
 
-        # Rename lat/lon dims to y/x
-        ds = ds.rename_dims({"lat": "y", "lon": "x"})
+        # Rename spatial dims to y/x (dim names vary by file version)
+        dim_rename = {}
+        for old, new in [("lat", "y"), ("lon", "x"), ("north_south", "y"), ("east_west", "x")]:
+            if old in ds.dims and new not in ds.dims:
+                dim_rename[old] = new
+        if dim_rename:
+            ds = ds.rename_dims(dim_rename)
         ds.load()
 
         if dataset_id is None or dataset_id == "all":

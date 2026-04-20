@@ -5,6 +5,7 @@ import sys
 import argparse
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,22 @@ def main() -> None:
     )
     parser.add_argument("--lis-path", required=True, type=Path)
     parser.add_argument("--input-dir", type=Path, default=Path("."))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to write timestamped report file (default: print to stdout only)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "VIIRS uses no weights files; this flag clears the pyresample resampler "
+            "cache between runs so each method is benchmarked cold. "
+            "Has no effect on the output report format."
+        ),
+    )
     ns = parser.parse_args()
 
     viirs_files = sorted(ns.input_dir.glob(VIIRS_GLOB))
@@ -75,6 +92,15 @@ def main() -> None:
 
     results: list[BenchmarkResult] = []
     for method in METHODS:
+        if ns.no_cache:
+            # Clear pyresample's resampler cache so the method is benchmarked cold
+            try:
+                from pyresample.kd_tree import KDTreeResampler
+                KDTreeResampler.cache = {}
+            except (ImportError, AttributeError):
+                pass
+            import gc
+            gc.collect()
         elapsed, rss_delta = _time_call(
             regrid, composite_da, source_def, lis_area, method=method
         )
@@ -89,6 +115,13 @@ def main() -> None:
         log.info("%s: %.2f s, %.1f MiB", method, elapsed, rss_delta)
 
     print(render_report(results, title="VIIRS Regrid Benchmark"))
+
+    if ns.output_dir is not None:
+        ts = datetime.now(tz=timezone.utc)
+        ns.output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = ns.output_dir / f"viirs_benchmark_{ts.strftime('%Y%m%dT%H%M%SZ')}.txt"
+        report_path.write_text(render_report(results, title="VIIRS Regrid Benchmark", timestamp=ts))
+        log.info("Report written to %s", report_path)
 
 
 if __name__ == "__main__":

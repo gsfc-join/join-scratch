@@ -4,6 +4,7 @@
 import sys
 import argparse
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -31,6 +32,21 @@ def main() -> None:
     parser.add_argument("--lis-path", required=True, type=Path)
     parser.add_argument("--input-dir", type=Path, default=Path("."))
     parser.add_argument("--weights-dir", type=Path, default=Path("_data/amsr2"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to write timestamped report file (default: print to stdout only)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Force regeneration of weights files even if they already exist, "
+            "and include weights-generation time in the report."
+        ),
+    )
     ns = parser.parse_args()
 
     amsr2_files = sorted(ns.input_dir.glob(AMSR2_GLOB))
@@ -55,7 +71,33 @@ def main() -> None:
     for method in ("nearest_s2d", "bilinear"):
         weights_path = ns.weights_dir / f"amsr2-lis-weights-{method}.nc"
         ns.weights_dir.mkdir(parents=True, exist_ok=True)
-        compute_weights(source_grid, lis_grid, weights_path, method=method)
+
+        if ns.no_cache:
+            # Delete existing weights file so compute_weights always regenerates
+            if weights_path.exists():
+                weights_path.unlink()
+                log.info("--no-cache: removed existing weights file %s", weights_path)
+            weights_elapsed, weights_rss = _time_call(
+                compute_weights, source_grid, lis_grid, weights_path, method=method
+            )
+            log.info(
+                "%s weights generation: %.2f s, %.1f MiB",
+                method,
+                weights_elapsed,
+                weights_rss,
+            )
+            results.append(
+                BenchmarkResult(
+                    label=f"AMSR2 {method} [weights gen]",
+                    source_shape=source_shape,
+                    elapsed_s=weights_elapsed,
+                    rss_delta_mib=weights_rss,
+                    notes="weights generation only",
+                )
+            )
+        else:
+            compute_weights(source_grid, lis_grid, weights_path, method=method)
+
         regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
         elapsed, rss_delta = _time_call(regridder, ds)
@@ -70,6 +112,13 @@ def main() -> None:
         log.info("%s: %.2f s, %.1f MiB", method, elapsed, rss_delta)
 
     print(render_report(results, title="AMSR2 Regrid Benchmark"))
+
+    if ns.output_dir is not None:
+        ts = datetime.now(tz=timezone.utc)
+        ns.output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = ns.output_dir / f"amsr2_benchmark_{ts.strftime('%Y%m%dT%H%M%SZ')}.txt"
+        report_path.write_text(render_report(results, title="AMSR2 Regrid Benchmark", timestamp=ts))
+        log.info("Report written to %s", report_path)
 
 
 if __name__ == "__main__":
