@@ -23,11 +23,18 @@ platforms = ["linux-64", "osx-arm64"]
 join_scratch = { path = ".", editable = true }
 
 [tool.pixi.tasks]
-bench_amsr2 = "python3 src/join_scratch/amsr2/amsr2_regrid_benchmark.py"
-bench_viirs = "python3 src/join_scratch/viirs/viirs_regrid_benchmark.py"
-bench_ceda = "python3 src/join_scratch/ceda/ceda_regrid_benchmark.py"
-icesat2 = "python3 -m join_scratch.icesat2.atl06_regrid"
-viz_icesat2 = "python3 -m join_scratch.icesat2.atl06_visualize"
+get_is2 = """
+python3 workflows/swe/fetch_atl06.py
+"""
+
+swe = """
+python3 workflows/swe/full-workflow.py \\
+          --lis-path s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc \\
+          --amsr2-dir s3://airborne-smce-prod-user-bucket/JOIN/AMSR2/ \\
+          --ceda-dir s3://airborne-smce-prod-user-bucket/JOIN/CEDA/ \\
+          --viirs-dir s3://airborne-smce-prod-user-bucket/JOIN/VIIRS/
+"""
+
 
 [tool.pixi.dependencies]
 python = ">=3.14.4,<3.15"
