@@ -28,11 +28,12 @@ python3 workflows/swe/fetch_atl06.py
 """
 
 swe = """
-python3 workflows/swe/full-workflow.py \\
-          --lis-path s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc \\
-          --amsr2-dir s3://airborne-smce-prod-user-bucket/JOIN/AMSR2/ \\
-          --ceda-dir s3://airborne-smce-prod-user-bucket/JOIN/CEDA/ \\
-          --viirs-dir s3://airborne-smce-prod-user-bucket/JOIN/VIIRS/
+python3 workflows/swe/full-workflow.py \
+          --lis-path s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc \
+          --amsr2-dir s3://airborne-smce-prod-user-bucket/JOIN/AMSR2/ \
+          --ceda-dir s3://airborne-smce-prod-user-bucket/JOIN/CEDA/ \
+          --viirs-dir s3://airborne-smce-prod-user-bucket/JOIN/VIIRS/ \
+          --icesat2-parquet s3://airborne-smce-prod-user-bucket/JOIN/results/swe/atl06.parquet
 """
 
 
