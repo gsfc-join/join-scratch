@@ -222,7 +222,44 @@ def _regrid_ceda(
     }
 
 
-def _regrid_viirs(
+def _viirs_tile_bbox(h: int, v: int) -> tuple[float, float, float, float]:
+    """Return (lon_min, lat_min, lon_max, lat_max) for a MODIS/VIIRS h/v tile.
+
+    The MODIS sinusoidal tile grid divides the globe into 36 × 18 tiles.
+    Each tile spans exactly 10° of latitude and ~10° equivalent in the
+    sinusoidal projection.  Tile (h=0, v=0) is the top-left (north-west) tile.
+    """
+    lat_max = 90.0 - v * 10.0
+    lat_min = lat_max - 10.0
+    # Longitude extent depends on latitude; use the wider of top/bottom edge
+    # sin-projection x-extent per tile is (2*pi*R/36) metres, but for bbox
+    # purposes we just use the geographic span at each latitude edge.
+    import math
+    def _lon_half_width(lat_deg):
+        lat_r = math.radians(abs(lat_deg))
+        cos_lat = math.cos(lat_r) if lat_r < math.pi / 2 else 1e-9
+        return 10.0 / cos_lat  # degrees longitude for 10° equivalent arc
+    hw = max(_lon_half_width(lat_min), _lon_half_width(lat_max))
+    lon_centre = -180.0 + (h + 0.5) * (360.0 / 36.0)
+    return lon_centre - hw, lat_min, lon_centre + hw, lat_max
+
+
+def _viirs_tile_overlaps_area(h: int, v: int, area) -> bool:
+    """Return True if the VIIRS tile (h, v) may overlap *area*'s lat/lon bbox."""
+    lon_min, lat_min, lon_max, lat_max = _viirs_tile_bbox(h, v)
+    # Get the area's geographic bounding box from its 4 corner lon/lats
+    try:
+        corners = area.outer_boundary_corners  # list of (lon, lat) corner pairs
+        corner_lons = [c[0] for c in corners]
+        corner_lats = [c[1] for c in corners]
+        a_lon_min, a_lon_max = min(corner_lons), max(corner_lons)
+        a_lat_min, a_lat_max = min(corner_lats), max(corner_lats)
+    except Exception:
+        return True  # Can't determine — include tile to be safe
+    return not (lon_max < a_lon_min or lon_min > a_lon_max or
+                lat_max < a_lat_min or lat_min > a_lat_max)
+
+
     input_dir: str,
     lis_area,
     method: str,
@@ -244,6 +281,25 @@ def _regrid_viirs(
         date_groups[date_key].append(p)
 
     date_key, paths = next(iter(sorted(date_groups.items())))
+
+    # Filter to tiles that spatially overlap the LIS domain
+    filtered = []
+    skipped = 0
+    for p in paths:
+        fname = _path_name(p)
+        m = __import__("re").search(r"\.h(\d{2})v(\d{2})\.", fname)
+        if m is not None:
+            h, v = int(m.group(1)), int(m.group(2))
+            if not _viirs_tile_overlaps_area(h, v, lis_area):
+                skipped += 1
+                continue
+        filtered.append(p)
+    if skipped:
+        log.info("VIIRS: skipped %d tile(s) outside LIS domain bbox", skipped)
+    paths = filtered
+    if not paths:
+        log.warning("VIIRS: no tiles overlap the LIS domain — skipping")
+        return {}
     log.info("VIIRS: using date %s (%d tile(s))", date_key, len(paths))
 
     all_data, all_lons, all_lats = [], [], []
