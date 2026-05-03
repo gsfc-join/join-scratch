@@ -1,3 +1,6 @@
+# Terraform outputs
+_aws-sandbox/_tfout.json
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
