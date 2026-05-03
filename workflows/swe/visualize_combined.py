@@ -685,15 +685,20 @@ def main():
 
             if is_viirs:
                 ax_zs.set_extent(poly_extent, crs=PC)
+                im_z = None
                 for tile_data, tile_lons, tile_lats in ds_info["src_tiles"]:
-                    im = ax_zs.pcolormesh(
+                    # skip tiles with no overlap with this polygon
+                    if (tile_lons.max() < poly_extent[0] or tile_lons.min() > poly_extent[1] or
+                            tile_lats.max() < poly_extent[2] or tile_lats.min() > poly_extent[3]):
+                        continue
+                    im_z = ax_zs.pcolormesh(
                         tile_lons, tile_lats, tile_data, transform=PC,
                         vmin=vmin, vmax=vmax, cmap=cmap, shading="auto", rasterized=True
                     )
                 add_map_features(ax_zs)
                 ax_zs.set_title(ds_info["src_title"], fontsize=8)
-                if im:
-                    plt.colorbar(im, ax=ax_zs, orientation="horizontal",
+                if im_z is not None:
+                    plt.colorbar(im_z, ax=ax_zs, orientation="horizontal",
                                  pad=0.02, label=var_label)
             else:
                 if scatter:
