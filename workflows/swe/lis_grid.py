@@ -1,6 +1,8 @@
 """Shared LIS grid utilities for SWE workflow scripts."""
 
+import hashlib
 import logging
+import pickle
 from pathlib import Path
 
 import pyproj
@@ -69,7 +71,12 @@ def load_lis_grid(path: Path | str, fs=None) -> xr.Dataset:
     return ds
 
 
-def build_lis_area_definition(path: Path | str, fs=None) -> AreaDefinition:
+def build_lis_area_definition(
+    path: Path | str,
+    fs=None,
+    cache_dir: Path | str | None = "_data/weights",
+    overwrite: bool = False,
+) -> AreaDefinition:
     """Construct a pyresample AreaDefinition for the LIS Lambert Conformal grid.
 
     All parameters are read from the global attributes of the LIS input file:
@@ -78,6 +85,9 @@ def build_lis_area_definition(path: Path | str, fs=None) -> AreaDefinition:
       - TRUELAT1/TRUELAT2, STANDARD_LON
       - DX/DY (km), grid shape from the lat/lon variable dimensions
 
+    The result is pickled to *cache_dir* so subsequent calls are near-instant.
+    Pass *overwrite=True* to force recomputation.
+
     Parameters
     ----------
     path:
@@ -85,7 +95,20 @@ def build_lis_area_definition(path: Path | str, fs=None) -> AreaDefinition:
     fs:
         Optional obstore ``FsspecStore``.  If *None* and *path* is an S3 URI,
         a store is created automatically.
+    cache_dir:
+        Local directory for the pickle cache.  Pass *None* to disable caching.
+    overwrite:
+        If True, recompute and overwrite any existing cache file.
     """
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        key = hashlib.md5(str(path).encode()).hexdigest()[:12]
+        cache_path = Path(cache_dir) / f"lis-area-def-{key}.pkl"
+        if cache_path.exists() and not overwrite:
+            log.info("Reusing cached LIS AreaDefinition from %s", cache_path)
+            with cache_path.open("rb") as f:
+                return pickle.load(f)
+
     log.info("Building LIS AreaDefinition from %s", path)
     ds = _open_lis_ds(path, fs=fs)
     ds.load()
@@ -121,7 +144,7 @@ def build_lis_area_definition(path: Path | str, fs=None) -> AreaDefinition:
     x_max = x_min + nx * dx_m
     y_max = y_min + ny * dy_m
 
-    return AreaDefinition(
+    area_def = AreaDefinition(
         "lis_lcc",
         "LIS Lambert Conformal 1 km",
         "lis_lcc",
@@ -130,3 +153,11 @@ def build_lis_area_definition(path: Path | str, fs=None) -> AreaDefinition:
         ny,
         (x_min, y_min, x_max, y_max),
     )
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("wb") as f:
+            pickle.dump(area_def, f)
+        log.info("LIS AreaDefinition cached to %s", cache_path)
+
+    return area_def

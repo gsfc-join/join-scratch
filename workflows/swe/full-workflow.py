@@ -388,7 +388,7 @@ def main() -> None:
     fs = make_fs() if any_s3 else None
 
     lis_grid = load_lis_grid(ns.lis_path, fs=fs)
-    lis_area = build_lis_area_definition(ns.lis_path, fs=fs)
+    lis_area = build_lis_area_definition(ns.lis_path, fs=fs, cache_dir=ns.weights_dir, overwrite=ns.overwrite_weights)
 
     data_vars: dict[str, xr.DataArray] = {}
 
