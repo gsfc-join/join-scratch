@@ -260,6 +260,7 @@ def _viirs_tile_overlaps_area(h: int, v: int, area) -> bool:
                 lat_max < a_lat_min or lat_min > a_lat_max)
 
 
+def _regrid_viirs(
     input_dir: str,
     lis_area,
     method: str,
