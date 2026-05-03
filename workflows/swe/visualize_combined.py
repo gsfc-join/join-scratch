@@ -260,15 +260,30 @@ def _load_icesat2_source(parquet_path: str, fs=None):
 
 # ── crop helpers ──────────────────────────────────────────────────────────────
 
-def _crop_2d_grid(data, lons_1d, lats_1d, lon_min, lon_max, lat_min, lat_max):
-    """Crop a 2-D (lat × lon) array to a lon/lat bounding box."""
-    lat_mask = (lats_1d >= lat_min) & (lats_1d <= lat_max)
-    lon_mask = (lons_1d >= lon_min) & (lons_1d <= lon_max)
-    return (
-        data[np.ix_(lat_mask, lon_mask)],
-        lons_1d[lon_mask],
-        lats_1d[lat_mask],
-    )
+def _crop_2d_grid(data, lons, lats, lon_min, lon_max, lat_min, lat_max):
+    """Mask a 2-D grid to a lon/lat bounding box.
+
+    Works for both 1-D (regular) and 2-D (projected) coordinate arrays.
+    Returns the same shaped arrays with out-of-bbox values set to NaN.
+    For 1-D inputs, slices the arrays; for 2-D inputs, returns full arrays masked.
+    """
+    if lons.ndim == 1 and lats.ndim == 1:
+        lat_mask = (lats >= lat_min) & (lats <= lat_max)
+        lon_mask = (lons >= lon_min) & (lons <= lon_max)
+        return (
+            data[np.ix_(lat_mask, lon_mask)],
+            lons[lon_mask],
+            lats[lat_mask],
+        )
+    else:
+        # 2-D projected grid: mask out-of-bbox as NaN, return full arrays
+        bbox_mask = (
+            (lons >= lon_min) & (lons <= lon_max) &
+            (lats >= lat_min) & (lats <= lat_max)
+        )
+        masked = data.astype(float).copy()
+        masked[~bbox_mask] = np.nan
+        return masked, lons, lats
 
 
 def _crop_scatter(vals, lons, lats, lon_min, lon_max, lat_min, lat_max):
