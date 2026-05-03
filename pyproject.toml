@@ -34,7 +34,20 @@ python3 workflows/swe/full-workflow.py \
           --ceda-dir s3://airborne-smce-prod-user-bucket/JOIN/CEDA/ \
           --viirs-dir s3://airborne-smce-prod-user-bucket/JOIN/VIIRS/ \
           --icesat2-parquet s3://airborne-smce-prod-user-bucket/JOIN/results/swe/atl06.parquet \
+          --output-path s3://airborne-smce-prod-user-bucket/JOIN/results/swe/swe_combined.nc \
           --max-viirs-tiles 30
+"""
+
+swe_visualize = """
+python3 workflows/swe/visualize_combined.py \
+          --lis-path s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc \
+          --regridded-path s3://airborne-smce-prod-user-bucket/JOIN/results/swe/swe_combined.nc \
+          --amsr2-dir s3://airborne-smce-prod-user-bucket/JOIN/AMSR2/ \
+          --ceda-dir s3://airborne-smce-prod-user-bucket/JOIN/CEDA/ \
+          --viirs-dir s3://airborne-smce-prod-user-bucket/JOIN/VIIRS/ \
+          --icesat2-parquet s3://airborne-smce-prod-user-bucket/JOIN/results/swe/atl06.parquet \
+          --polygons-path workflows/swe/zoom_polygons.geojson \
+          --output-dir s3://airborne-smce-prod-user-bucket/JOIN/results/figures/swe
 """
 
 

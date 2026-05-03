@@ -1,0 +1,35 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "northern_plains", "description": "Northern Plains / South Dakota"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-101.0, 44.5], [-97.0, 44.5], [-97.0, 46.5], [-101.0, 46.5], [-101.0, 44.5]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "ozarks", "description": "Ozark Plateau / Missouri–Arkansas"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-93.5, 36.5], [-90.5, 36.5], [-90.5, 38.5], [-93.5, 38.5], [-93.5, 36.5]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "great_lakes_border", "description": "Wisconsin / Upper Michigan border region"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-92.0, 45.5], [-88.5, 45.5], [-88.5, 47.5], [-92.0, 47.5], [-92.0, 45.5]
+        ]]
+      }
+    }
+  ]
+}
