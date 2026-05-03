@@ -267,6 +267,7 @@ def _regrid_viirs(
     lis_area,
     method: str,
     fs=None,
+    max_tiles: int | None = None,
 ) -> dict[str, xr.DataArray]:
     """Regrid the first VIIRS date group found and return {var_name: DataArray}."""
     from pyresample.geometry import SwathDefinition
@@ -303,6 +304,12 @@ def _regrid_viirs(
     if not paths:
         log.warning("VIIRS: no tiles overlap the LIS domain — skipping")
         return {}
+    if max_tiles is not None and len(paths) > max_tiles:
+        raise RuntimeError(
+            f"VIIRS: {len(paths)} tile(s) would be loaded but --max-viirs-tiles={max_tiles}. "
+            "Aborting to prevent OOM. Either the spatial filter is not working correctly "
+            "or the domain is unusually large. Increase --max-viirs-tiles only if expected."
+        )
     log.info("VIIRS: using date %s (%d tile(s))", date_key, len(paths))
 
     all_data, all_lons, all_lats = [], [], []
@@ -436,6 +443,8 @@ def main() -> None:
                         help="pyresample regridding method for VIIRS.")
     parser.add_argument("--overwrite-weights", action="store_true", default=False,
                         help="Always recompute xESMF weights even if cached files exist.")
+    parser.add_argument("--max-viirs-tiles", type=int, default=None, metavar="N",
+                        help="Abort before loading if the filtered VIIRS tile count exceeds N.")
     ns = parser.parse_args()
 
     # Build a shared fsspec store if any S3 paths are present
@@ -458,7 +467,7 @@ def main() -> None:
         data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir, overwrite_weights=ns.overwrite_weights, fs=fs))
 
     if ns.viirs_dir is not None:
-        data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, fs=fs))
+        data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, fs=fs, max_tiles=ns.max_viirs_tiles))
 
     if ns.icesat2_parquet is not None:
         data_vars.update(_regrid_icesat2(ns.icesat2_parquet, lis_area, lis_grid, fs=fs))
