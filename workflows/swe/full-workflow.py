@@ -249,9 +249,11 @@ def _viirs_tile_overlaps_area(h: int, v: int, area) -> bool:
     lon_min, lat_min, lon_max, lat_max = _viirs_tile_bbox(h, v)
     # Get the area's geographic bounding box from its 4 corner lon/lats
     try:
-        corners = area.outer_boundary_corners  # list of (lon, lat) corner pairs
-        corner_lons = [c[0] for c in corners]
-        corner_lats = [c[1] for c in corners]
+        import math as _math
+        corners = area.outer_boundary_corners  # list of Coordinate objects (lon/lat in radians)
+        # Coordinate objects have .lon and .lat attributes in radians
+        corner_lons = [_math.degrees(c.lon) for c in corners]
+        corner_lats = [_math.degrees(c.lat) for c in corners]
         a_lon_min, a_lon_max = min(corner_lons), max(corner_lons)
         a_lat_min, a_lat_max = min(corner_lats), max(corner_lats)
     except Exception:
