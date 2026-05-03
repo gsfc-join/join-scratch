@@ -637,7 +637,9 @@ def main():
         _save_figure(fig, _output_path(ns.output_dir, f"{name}_overview.png"), fs=fs)
         plt.close(fig)
 
-        # ── Per-polygon figures ──
+        # ── Per-polygon figures (skip for ICESat-2: data too sparse) ──
+        if name == "icesat2_h_li":
+            continue
         for poly in polygons:
             pname = poly["name"]
             plo_min, plo_max = poly["lon_min"], poly["lon_max"]
