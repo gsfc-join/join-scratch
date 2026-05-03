@@ -78,7 +78,8 @@ def _list_files(dir_path: str, suffix: str, fs=None) -> list[str]:
         bucket, _, prefix = without_scheme.partition("/")
         store = make_store(bucket, prefix=prefix)
         keys = list_s3(store)
-        urls = [f"s3://{bucket}/{k}" for k in keys if k.endswith(suffix)]
+        prefix_slash = prefix.rstrip("/") + "/" if prefix else ""
+        urls = [f"s3://{bucket}/{prefix_slash}{k}" for k in keys if k.endswith(suffix)]
         return sorted(urls)
     else:
         return [str(p) for p in sorted(Path(dir_path).glob(f"**/*{suffix}"))]
@@ -103,6 +104,7 @@ def _regrid_amsr2(
     lis_grid: xr.Dataset,
     method: str,
     weights_dir: str,
+    overwrite_weights: bool = False,
     fs=None,
 ) -> dict[str, xr.DataArray]:
     """Regrid the first AMSR2 file found and return {var_name: DataArray}."""
@@ -124,7 +126,7 @@ def _regrid_amsr2(
 
     weights_local_dir = _ensure_local_dir(weights_dir)
     weights_path = weights_local_dir / f"amsr2-lis-weights-{method}.nc"
-    compute_weights(source_grid, lis_grid, weights_path, method=method)
+    compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
     da = handler.get_dataset().rename({"y": "lat", "x": "lon"}).sortby("lat")
@@ -168,6 +170,7 @@ def _regrid_ceda(
     lis_grid: xr.Dataset,
     method: str,
     weights_dir: str,
+    overwrite_weights: bool = False,
     fs=None,
 ) -> dict[str, xr.DataArray]:
     """Regrid the first CEDA file found and return {var_name: DataArray}."""
@@ -197,7 +200,7 @@ def _regrid_ceda(
 
     weights_local_dir = _ensure_local_dir(weights_dir)
     weights_path = weights_local_dir / f"ceda-lis-weights-{method}.nc"
-    compute_weights(source_grid, lis_grid, weights_path, method=method)
+    compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
     # Restore lat/lon as dim names for xESMF
@@ -372,6 +375,8 @@ def main() -> None:
     parser.add_argument("--viirs-method", default="nearest",
                         choices=["nearest", "bilinear", "ewa", "bucket_avg"],
                         help="pyresample regridding method for VIIRS.")
+    parser.add_argument("--overwrite-weights", action="store_true", default=False,
+                        help="Always recompute xESMF weights even if cached files exist.")
     ns = parser.parse_args()
 
     # Build a shared fsspec store if any S3 paths are present
@@ -388,10 +393,10 @@ def main() -> None:
     data_vars: dict[str, xr.DataArray] = {}
 
     if ns.amsr2_dir is not None:
-        data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir, fs=fs))
+        data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir, overwrite_weights=ns.overwrite_weights, fs=fs))
 
     if ns.ceda_dir is not None:
-        data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir, fs=fs))
+        data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir, overwrite_weights=ns.overwrite_weights, fs=fs))
 
     if ns.viirs_dir is not None:
         data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, fs=fs))

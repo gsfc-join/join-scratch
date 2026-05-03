@@ -29,11 +29,17 @@ def compute_weights(
     target_grid: xr.Dataset,
     weights_path: Path,
     method: str = "bilinear",
+    overwrite: bool = False,
 ) -> Path:
     """Compute xESMF regridding weights and save them to *weights_path*.
 
-    Always recomputes — never reuses an existing file.  Returns *weights_path*.
+    If *weights_path* already exists and *overwrite* is False, skip recomputation
+    and return the existing path.  Set *overwrite=True* to always recompute.
+    Returns *weights_path*.
     """
+    if weights_path.exists() and not overwrite:
+        log.info("Reusing existing xESMF weights from %s", weights_path)
+        return weights_path
     log.info("Computing xESMF %s weights …", method)
     regridder = _xesmf().Regridder(
         source_grid,
