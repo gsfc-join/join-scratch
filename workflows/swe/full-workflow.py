@@ -16,14 +16,26 @@ and writes all outputs into a single NetCDF file with informatively named variab
 For AMSR2 ``inner`` dimension (phony_dim_2): index 0 = ascending-pass mean value,
 index 1 = descending-pass uncertainty, per dataset documentation.
 
-Usage example
-─────────────
+Paths may be local file-system paths or ``s3://`` URIs — detection is automatic.
+
+Usage example (local)
+─────────────────────
     python full-workflow.py \\
         --lis-path /data/lis_input_NMP_1000m_missouri.nc \\
         --amsr2-dir /data/amsr2 \\
         --ceda-dir  /data/ceda \\
         --viirs-dir /data/viirs \\
         --icesat2-parquet /data/icesat2/atl06.parquet \\
+        --output-path /data/swe_combined.nc
+
+Usage example (S3)
+──────────────────
+    python full-workflow.py \\
+        --lis-path s3://my-bucket/lis_input_NMP_1000m_missouri.nc \\
+        --amsr2-dir s3://my-bucket/amsr2 \\
+        --ceda-dir  s3://my-bucket/ceda \\
+        --viirs-dir s3://my-bucket/viirs \\
+        --icesat2-parquet s3://my-bucket/icesat2/atl06.parquet \\
         --output-path /data/swe_combined.nc
 """
 
@@ -42,6 +54,7 @@ from join_scratch.datasets import Amsr2FileHandler, CedaFileHandler, Icesat2File
 from join_scratch.regrid import regrid
 from join_scratch.regrid.regular_to_regular import compute_weights, load_regridder
 from lis_grid import build_lis_area_definition, load_lis_grid
+from s3_utils import _is_s3, make_fs, make_store, list_s3, handler_from_s3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,29 +68,62 @@ CEDA_GLOB = "**/*.nc"
 VIIRS_GLOB = "**/*.h5"
 
 
+# ── path helpers ──────────────────────────────────────────────────────────────
+
+def _list_files(dir_path: str, suffix: str, fs=None) -> list[str]:
+    """List files under *dir_path* matching *suffix*, local or S3."""
+    if _is_s3(dir_path):
+        # Parse bucket and prefix from s3://bucket/prefix
+        without_scheme = dir_path[len("s3://"):]
+        bucket, _, prefix = without_scheme.partition("/")
+        store = make_store(bucket, prefix=prefix)
+        keys = list_s3(store)
+        urls = [f"s3://{bucket}/{k}" for k in keys if k.endswith(suffix)]
+        return sorted(urls)
+    else:
+        return [str(p) for p in sorted(Path(dir_path).glob(f"**/*{suffix}"))]
+
+
+def _path_name(path_str: str) -> str:
+    """Return a short display name for a path (last component)."""
+    return path_str.rstrip("/").split("/")[-1]
+
+
+def _ensure_local_dir(path: str) -> Path:
+    """Ensure a local directory exists and return it as a Path."""
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _regrid_amsr2(
-    input_dir: Path,
+    input_dir: str,
     lis_grid: xr.Dataset,
     method: str,
-    weights_dir: Path,
+    weights_dir: str,
+    fs=None,
 ) -> dict[str, xr.DataArray]:
     """Regrid the first AMSR2 file found and return {var_name: DataArray}."""
-    files = sorted(input_dir.glob(AMSR2_GLOB))
+    files = _list_files(input_dir, ".h5", fs=fs)
     if not files:
         log.warning("No AMSR2 files found under %s — skipping", input_dir)
         return {}
     path = files[0]
-    log.info("AMSR2: using %s", path.name)
+    log.info("AMSR2: using %s", _path_name(path))
 
-    handler = Amsr2FileHandler.from_path(path)
+    if _is_s3(path):
+        handler = handler_from_s3(Amsr2FileHandler, path, fs=fs)
+    else:
+        handler = Amsr2FileHandler.from_path(path)
+
     lat_asc = np.sort(handler._lat)
     lon_asc = np.sort(handler._lon)
     source_grid = xr.Dataset(coords={"lat": lat_asc, "lon": lon_asc})
 
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = weights_dir / f"amsr2-lis-weights-{method}.nc"
+    weights_local_dir = _ensure_local_dir(weights_dir)
+    weights_path = weights_local_dir / f"amsr2-lis-weights-{method}.nc"
     compute_weights(source_grid, lis_grid, weights_path, method=method)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
@@ -100,7 +146,7 @@ def _regrid_amsr2(
         return xr.DataArray(
             arr.values.astype(np.float32),
             dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": path.name},
+            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
         )
 
     return {
@@ -118,20 +164,25 @@ def _regrid_amsr2(
 
 
 def _regrid_ceda(
-    input_dir: Path,
+    input_dir: str,
     lis_grid: xr.Dataset,
     method: str,
-    weights_dir: Path,
+    weights_dir: str,
+    fs=None,
 ) -> dict[str, xr.DataArray]:
     """Regrid the first CEDA file found and return {var_name: DataArray}."""
-    files = sorted(input_dir.glob(CEDA_GLOB))
+    files = _list_files(input_dir, ".nc", fs=fs)
     if not files:
         log.warning("No CEDA files found under %s — skipping", input_dir)
         return {}
     path = files[0]
-    log.info("CEDA: using %s", path.name)
+    log.info("CEDA: using %s", _path_name(path))
 
-    handler = CedaFileHandler.from_path(path)
+    if _is_s3(path):
+        handler = handler_from_s3(CedaFileHandler, path, fs=fs)
+    else:
+        handler = CedaFileHandler.from_path(path)
+
     ds = handler.get_dataset()
 
     lat_vals = ds["lat"].values if "lat" in ds else ds["y"].values
@@ -144,8 +195,8 @@ def _regrid_ceda(
         coords={"lat": np.sort(np.unique(lat_vals)), "lon": np.sort(np.unique(lon_vals))}
     )
 
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = weights_dir / f"ceda-lis-weights-{method}.nc"
+    weights_local_dir = _ensure_local_dir(weights_dir)
+    weights_path = weights_local_dir / f"ceda-lis-weights-{method}.nc"
     compute_weights(source_grid, lis_grid, weights_path, method=method)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
@@ -159,7 +210,7 @@ def _regrid_ceda(
         return xr.DataArray(
             arr.values.astype(np.float32),
             dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": path.name},
+            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
         )
 
     return {
@@ -169,22 +220,24 @@ def _regrid_ceda(
 
 
 def _regrid_viirs(
-    input_dir: Path,
+    input_dir: str,
     lis_area,
     method: str,
+    fs=None,
 ) -> dict[str, xr.DataArray]:
     """Regrid the first VIIRS date group found and return {var_name: DataArray}."""
     from pyresample.geometry import SwathDefinition
 
-    files = sorted(input_dir.glob(VIIRS_GLOB))
+    files = _list_files(input_dir, ".h5", fs=fs)
     if not files:
         log.warning("No VIIRS files found under %s — skipping", input_dir)
         return {}
 
-    date_groups: dict[str, list[Path]] = defaultdict(list)
+    date_groups: dict[str, list[str]] = defaultdict(list)
     for p in files:
-        parts = p.stem.split(".")
-        date_key = parts[1] if len(parts) > 1 else p.stem
+        stem = _path_name(p).rsplit(".", 1)[0] if "." in _path_name(p) else _path_name(p)
+        parts = stem.split(".")
+        date_key = parts[1] if len(parts) > 1 else stem
         date_groups[date_key].append(p)
 
     date_key, paths = next(iter(sorted(date_groups.items())))
@@ -192,7 +245,10 @@ def _regrid_viirs(
 
     all_data, all_lons, all_lats = [], [], []
     for path in paths:
-        handler = ViirsFileHandler.from_path(path)
+        if _is_s3(path):
+            handler = handler_from_s3(ViirsFileHandler, path, fs=fs)
+        else:
+            handler = ViirsFileHandler.from_path(path)
         da = handler.get_dataset()
         swath_def = da.attrs["area"]
         all_data.append(da.values)
@@ -225,16 +281,25 @@ def _regrid_viirs(
 
 
 def _regrid_icesat2(
-    parquet_path: Path,
+    parquet_path: str,
     lis_area,
     lis_grid: xr.Dataset,
+    fs=None,
 ) -> dict[str, xr.DataArray]:
-    """Regrid ICESat-2 ATL06 point cloud and return {var_name: DataArray}."""
-    if not parquet_path.exists():
+    """Regrid ICESat-2 ATL06 point cloud and return {var_name: DataArray}.
+
+    For S3 URIs, the path is passed directly to geopandas.read_parquet which
+    delegates to pyarrow's native S3 support (no FSFile wrapper needed).
+    For local paths, existence is checked before proceeding.
+    """
+    if not _is_s3(parquet_path) and not Path(parquet_path).exists():
         log.warning("ICESat-2 Parquet not found at %s — skipping", parquet_path)
         return {}
-    log.info("ICESat-2: loading from %s", parquet_path)
+    # Icesat2FileHandler.get_dataset calls geopandas.read_parquet(str(self.filename))
+    # which supports s3:// URIs natively via pyarrow, so from_path without fs works.
     handler = Icesat2FileHandler.from_path(parquet_path)
+
+    log.info("ICESat-2: loading from %s", parquet_path)
     da = handler.get_dataset()
     source_area = da.attrs["area"]
     log.info("ICESat-2: regridding %d observations using mean …", len(da))
@@ -246,10 +311,31 @@ def _regrid_icesat2(
             attrs={
                 "long_name": "ICESat-2 ATL06 land-ice surface height (mean per LIS pixel)",
                 "units": "meters",
-                "source": parquet_path.name,
+                "source": _path_name(parquet_path),
             },
         )
     }
+
+
+def _write_output(ds_out: xr.Dataset, output_path: str, encoding: dict, fs=None) -> None:
+    """Write *ds_out* to *output_path*, which may be a local path or S3 URI."""
+    if _is_s3(output_path):
+        if fs is None:
+            fs = make_fs()
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            ds_out.to_netcdf(tmp_path, engine="h5netcdf", encoding=encoding)
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+            with fs.open(output_path, "wb") as fout:
+                fout.write(data)
+        finally:
+            os.unlink(tmp_path)
+    else:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        ds_out.to_netcdf(output_path, engine="h5netcdf", encoding=encoding)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -258,25 +344,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Regrid all SWE input datasets to the LIS grid and combine into "
-            "a single NetCDF file."
+            "a single NetCDF file.  All paths may be local or s3:// URIs."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--lis-path", required=True, type=Path,
-                        help="Path to the LIS input NetCDF file.")
-    parser.add_argument("--amsr2-dir", type=Path, default=None,
-                        help="Directory containing AMSR2 HDF5 files.")
-    parser.add_argument("--ceda-dir", type=Path, default=None,
-                        help="Directory containing CEDA ESA CCI SWE NetCDF files.")
-    parser.add_argument("--viirs-dir", type=Path, default=None,
-                        help="Directory containing VIIRS CGF snow cover HDF5 files.")
-    parser.add_argument("--icesat2-parquet", type=Path, default=None,
-                        help="Path to the cached ICESat-2 ATL06 Parquet file.")
-    parser.add_argument("--weights-dir", type=Path, default=Path("_data/weights"),
-                        help="Directory for xESMF weights files.")
-    parser.add_argument("--output-path", type=Path,
-                        default=Path("_data/swe_combined.nc"),
-                        help="Output combined NetCDF path.")
+    parser.add_argument("--lis-path", required=True,
+                        help="Path to the LIS input NetCDF file (local or s3://).")
+    parser.add_argument("--amsr2-dir", default=None,
+                        help="Directory containing AMSR2 HDF5 files (local or s3://).")
+    parser.add_argument("--ceda-dir", default=None,
+                        help="Directory containing CEDA ESA CCI SWE NetCDF files (local or s3://).")
+    parser.add_argument("--viirs-dir", default=None,
+                        help="Directory containing VIIRS CGF snow cover HDF5 files (local or s3://).")
+    parser.add_argument("--icesat2-parquet", default=None,
+                        help="Path to the cached ICESat-2 ATL06 Parquet file (local or s3://).")
+    parser.add_argument("--weights-dir", default="_data/weights",
+                        help="Local directory for xESMF weights files.")
+    parser.add_argument("--output-path", default="_data/swe_combined.nc",
+                        help="Output combined NetCDF path (local or s3://).")
     # Per-dataset method overrides
     parser.add_argument("--amsr2-method", default="bilinear",
                         choices=["bilinear", "nearest_s2d", "conservative"],
@@ -289,22 +374,30 @@ def main() -> None:
                         help="pyresample regridding method for VIIRS.")
     ns = parser.parse_args()
 
-    lis_grid = load_lis_grid(ns.lis_path)
-    lis_area = build_lis_area_definition(ns.lis_path)
+    # Build a shared fsspec store if any S3 paths are present
+    any_s3 = any(
+        _is_s3(str(p))
+        for p in [ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir, ns.icesat2_parquet]
+        if p is not None
+    )
+    fs = make_fs() if any_s3 else None
+
+    lis_grid = load_lis_grid(ns.lis_path, fs=fs)
+    lis_area = build_lis_area_definition(ns.lis_path, fs=fs)
 
     data_vars: dict[str, xr.DataArray] = {}
 
     if ns.amsr2_dir is not None:
-        data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir))
+        data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir, fs=fs))
 
     if ns.ceda_dir is not None:
-        data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir))
+        data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir, fs=fs))
 
     if ns.viirs_dir is not None:
-        data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method))
+        data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, fs=fs))
 
     if ns.icesat2_parquet is not None:
-        data_vars.update(_regrid_icesat2(ns.icesat2_parquet, lis_area, lis_grid))
+        data_vars.update(_regrid_icesat2(ns.icesat2_parquet, lis_area, lis_grid, fs=fs))
 
     if not data_vars:
         log.error(
@@ -334,9 +427,8 @@ def main() -> None:
         for var in data_vars
     }
 
-    ns.output_path.parent.mkdir(parents=True, exist_ok=True)
     log.info("Writing combined output to %s …", ns.output_path)
-    ds_out.to_netcdf(ns.output_path, engine="h5netcdf", encoding=encoding)
+    _write_output(ds_out, ns.output_path, encoding, fs=fs)
     log.info("Done: %s", ns.output_path)
 
     log.info("Variables written:")
