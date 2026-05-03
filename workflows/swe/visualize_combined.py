@@ -396,9 +396,10 @@ def main():
     log.info("Loading LIS grid from %s", ns.lis_path)
     lis_raw = _open_nc(ns.lis_path, fs=fs)
     lis = lis_raw.isel(north_south=slice(None, None, -1))
-    lis_lats = lis["lat"].values   # 1-D, ascending
-    lis_lons = lis["lon"].values   # 1-D
-    lis_lons_2d, lis_lats_2d = np.meshgrid(lis_lons, lis_lats)
+    lis_lats_2d = lis["lat"].values   # 2-D (north_south, east_west)
+    lis_lons_2d = lis["lon"].values   # 2-D
+    lis_lats = lis_lats_2d            # keep alias for extent/filter helpers
+    lis_lons = lis_lons_2d
 
     # LIS domain extent + buffer for source panels
     pad = 2.0
