@@ -527,6 +527,174 @@ All strategies return the same snow-depth value; the difference is latency:
 
 ---
 
+## Virtual Zarr with IceChunk
+
+HDF5 files are not cloud-optimised: accessing a small spatial subset requires
+many round trips to navigate the file's internal B-tree structures.  A
+**virtual Zarr** store solves this by recording the byte-offset of every
+chunk once, so future reads can issue a single, targeted range request per
+chunk.
+
+[VirtualiZarr](https://virtualizarr.readthedocs.io/) builds the manifest
+without copying the data; [IceChunk](https://icechunk.io/) stores it in a
+version-controlled, transactional repository.  Crucially, the same manifest
+can point to *multiple* physical locations (a local copy, the original HTTPS
+URL, an S3 mirror, …) — each in its own repository.
+
+```{python}
+import shutil
+import icechunk
+import virtualizarr as vz
+from virtualizarr.parsers.hdf.hdf import _construct_manifest_array
+```
+
+```{python}
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _av(v):
+    """Convert an HDF5 attribute value to a JSON-serialisable Python scalar."""
+    if isinstance(v, np.ndarray):
+        flat = v.flatten()
+        if flat.dtype.kind in ("S", "U", "O"):
+            items = [x.decode() if isinstance(x, bytes) else str(x) for x in flat]
+            return items[0] if len(items) == 1 else items
+        lst = flat.tolist()
+        return lst[0] if len(lst) == 1 else lst
+    return v.decode() if isinstance(v, bytes) else v
+
+
+def _build_virtual_dataset(hdf5_path: str, chunk_url: str) -> xr.Dataset:
+    """
+    Build a virtual xr.Dataset from a local HDF5 file whose chunks will be
+    fetched from *chunk_url* at read time.
+
+    We use the low-level ``_construct_manifest_array`` API instead of
+    ``vz.open_virtual_dataset`` because the root-group attributes of this
+    file contain object-array dtypes that VirtualiZarr cannot serialise to
+    JSON automatically.
+    """
+    with h5py.File(hdf5_path, "r") as f:
+        gd_ma = _construct_manifest_array(chunk_url, f["Geophysical Data"], "/")
+        ti_ma = _construct_manifest_array(chunk_url, f["Time Information"], "/")
+        ga  = {k: _av(v) for k, v in f.attrs.items()}
+        gda = {k: _av(v) for k, v in f["Geophysical Data"].attrs.items()}
+        tia = {k: _av(v) for k, v in f["Time Information"].attrs.items()}
+    return xr.Dataset(
+        {
+            "Geophysical_Data": xr.Variable(["lat", "lon", "band"], gd_ma, gda),
+            "Time_Information": xr.Variable(["lat", "lon"],          ti_ma, tia),
+        },
+        attrs=ga,
+    )
+
+
+def make_icechunk_repo(
+    store_dir: str,
+    hdf5_path: str,
+    chunk_url: str,
+    vc_prefix: str,
+    vc_store_config,
+) -> str:
+    """
+    Create a local IceChunk repository at *store_dir* whose virtual chunks
+    are resolved via *vc_prefix* / *vc_store_config*.
+
+    Any existing repository at *store_dir* is removed first.  Returns *store_dir*.
+    """
+    shutil.rmtree(store_dir, ignore_errors=True)
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(vc_prefix, vc_store_config)
+    )
+    storage = icechunk.local_filesystem_storage(store_dir)
+    repo = icechunk.Repository.create(storage, config=config)
+    vds = _build_virtual_dataset(hdf5_path, chunk_url)
+    session = repo.writable_session("main")
+    vds.vz.to_icechunk(session.store)
+    session.commit(f"Virtualize {Path(hdf5_path).name}")
+    return store_dir
+```
+
+```{python}
+# ── build two repositories: one pointing at the local copy, one at HTTPS ─────
+
+fname       = "GW1AM2_20260507_01D_EQMA_L3SGSNDHG2210210.h5"
+store_path  = Path("../_data/amsr2").resolve()
+hdf5_local  = str(store_path / fname)
+local_url   = f"file://{store_path}/{fname}"
+https_url   = (
+    "https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2"
+    f"/L3.SND_10/2/2026/05/{fname}"
+)
+
+IC_STORE_BASE = store_path / "icechunk-stores"
+LOCAL_IC_STORE = str(IC_STORE_BASE / "GW1AM2_20260507_EQMA_HG_local")
+HTTPS_IC_STORE = str(IC_STORE_BASE / "GW1AM2_20260507_EQMA_HG_https")
+
+# local repository — virtual chunks served from the local filesystem
+make_icechunk_repo(
+    LOCAL_IC_STORE,
+    hdf5_local,
+    local_url,
+    vc_prefix=f"file://{store_path}/",
+    vc_store_config=icechunk.local_filesystem_store(str(store_path)),
+)
+
+# https repository — virtual chunks fetched from G-Portal over HTTPS
+make_icechunk_repo(
+    HTTPS_IC_STORE,
+    hdf5_local,
+    https_url,
+    vc_prefix="https://gportal.jaxa.jp/",
+    vc_store_config=icechunk.http_store(),
+)
+
+print("Both IceChunk repositories created.")
+```
+
+```{python}
+# ── Alaska benchmark via IceChunk ─────────────────────────────────────────────
+
+def ak_mean_icechunk(store_dir: str, auth: dict) -> float:
+    """Mean snow depth (cm) over Alaska from an IceChunk repository."""
+    storage  = icechunk.local_filesystem_storage(store_dir)
+    repo     = icechunk.Repository.open(storage, authorize_virtual_chunk_access=auth)
+    session  = repo.readonly_session("main")
+    ds       = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+    raw      = (
+        ds["Geophysical_Data"]
+        .isel(lat=AK_ROWS, lon=AK_COLS, band=0)
+        .values
+    )
+    return float(np.nanmean(np.where(raw <= -32767, np.nan, raw.astype(float) * 0.1)))
+
+
+ic_scenarios = [
+    ("IceChunk → local chunks", LOCAL_IC_STORE, {f"file://{store_path}/": None}),
+    ("IceChunk → HTTPS chunks", HTTPS_IC_STORE, {"https://gportal.jaxa.jp/": None}),
+]
+
+ic_results = []
+for label, store_dir, auth in ic_scenarios:
+    t0      = time.perf_counter()
+    mean    = ak_mean_icechunk(store_dir, auth)
+    elapsed = time.perf_counter() - t0
+    ic_results.append((label, mean, elapsed))
+    print(f"{label:<30} — {mean:.2f} cm  ({elapsed:.2f} s)")
+
+t_ic_local = ic_results[0][2]
+print()
+print(f"  HTTPS vs local: {ic_results[1][2] / t_ic_local:.1f}× slower")
+```
+
+The local IceChunk repository is read at roughly the same speed as direct HDF5
+access (both are single-range-request reads per chunk).  The HTTPS repository is
+slower because each chunk still requires an HTTP round trip, but substantially
+faster than the `obstore_fsspec` approach because the manifest already knows
+the exact byte offsets — no HDF5 B-tree traversal overhead.
+
+---
+
 ## References
 
 - JAXA (2022). *AMSR2 Higher Level Product Format Description (EN)*. G-Portal.
