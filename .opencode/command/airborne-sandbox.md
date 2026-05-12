@@ -42,4 +42,16 @@ Create a `justfile` in the repo root (or add if it doesn't exist) with the follo
 - sandbox_destroy --- `terraform destroy` (don't skip terraform's confirmation)
 
 Ask the user if you should just create the instance or also launch it.
-If launching, check that AWS is already authenticated via AWS CLI STS command. If not, tell the user you are not connected; then, proceed with creating the configuration files but don't apply them. 
+If launching, check that AWS is already authenticated via AWS CLI STS command. If not, tell the user you are not connected; then, proceed with creating the configuration files but don't apply them.
+
+## Auto-stop schedule
+
+The deployment includes an optional auto-stop feature using **EventBridge Scheduler** (`aws_scheduler_schedule`). When enabled, it automatically stops the instance on a configurable schedule (default: 6pm ET daily). Stopping an already-stopped instance is a no-op, so this is safe to leave enabled.
+
+Key details:
+- Controlled by the `auto_stop_schedule` variable (EventBridge Scheduler cron expression). Set to `""` to disable.
+- Default: `"cron(0 18 * * ? *)"` — 6pm every day
+- Timezone: `America/New_York` (DST-aware; no manual UTC offset adjustment needed)
+- Mechanism: EventBridge Scheduler → SSM Automation `AWS-StopEC2Instance` → EC2 `StopInstances`
+- A dedicated IAM role is created for the scheduler with least-privilege permissions scoped to the specific instance
+- All resources are conditionally created (`count = var.auto_stop_schedule != "" ? 1 : 0`) 

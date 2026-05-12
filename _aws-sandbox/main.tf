@@ -64,8 +64,8 @@ data "aws_subnets" "default" {
 
 locals {
   # Pick a random subnet from the defaults if none specified
-  subnet_ids       = var.subnet_id == "" ? data.aws_subnets.default[0].ids : [var.subnet_id]
-  selected_subnet  = var.subnet_id != "" ? var.subnet_id : local.subnet_ids[random_integer.subnet_index.result % length(local.subnet_ids)]
+  subnet_ids      = var.subnet_id == "" ? data.aws_subnets.default[0].ids : [var.subnet_id]
+  selected_subnet = var.subnet_id != "" ? var.subnet_id : local.subnet_ids[random_integer.subnet_index.result % length(local.subnet_ids)]
 }
 
 resource "random_integer" "subnet_index" {
@@ -224,4 +224,72 @@ EOT
 resource "aws_ec2_instance_state" "sandbox" {
   instance_id = aws_instance.sandbox.id
   state       = var.instance_state
+}
+
+# ---------------------------------------------------------------------------
+# Auto-stop schedule (EventBridge Scheduler)
+# ---------------------------------------------------------------------------
+
+data "aws_caller_identity" "current" {}
+
+data "aws_iam_policy_document" "scheduler_assume_role" {
+  count = var.auto_stop_schedule != "" ? 1 : 0
+
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["scheduler.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "auto_stop_scheduler" {
+  count              = var.auto_stop_schedule != "" ? 1 : 0
+  name               = "${var.instance_name}-auto-stop-scheduler-role"
+  assume_role_policy = data.aws_iam_policy_document.scheduler_assume_role[0].json
+
+  tags = {
+    Name      = var.instance_name
+    ManagedBy = "Terraform"
+  }
+}
+
+data "aws_iam_policy_document" "auto_stop_ec2" {
+  count = var.auto_stop_schedule != "" ? 1 : 0
+
+  statement {
+    actions   = ["ec2:StopInstances"]
+    resources = ["arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.sandbox.id}"]
+  }
+}
+
+resource "aws_iam_role_policy" "auto_stop_ssm" {
+  count  = var.auto_stop_schedule != "" ? 1 : 0
+  name   = "auto-stop-ssm"
+  role   = aws_iam_role.auto_stop_scheduler[0].id
+  policy = data.aws_iam_policy_document.auto_stop_ec2[0].json
+}
+
+resource "aws_scheduler_schedule" "auto_stop" {
+  count       = var.auto_stop_schedule != "" ? 1 : 0
+  name        = "${var.instance_name}-auto-stop"
+  description = "Automatically stop ${var.instance_name} on schedule"
+
+  schedule_expression          = var.auto_stop_schedule
+  schedule_expression_timezone = "America/New_York"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = "arn:aws:scheduler:::aws-sdk:ec2:stopInstances"
+    role_arn = aws_iam_role.auto_stop_scheduler[0].arn
+
+    input = jsonencode({
+      InstanceIds = [aws_instance.sandbox.id]
+    })
+  }
 }

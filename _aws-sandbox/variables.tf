@@ -73,3 +73,9 @@ variable "instance_name" {
   description = "Name tag for the EC2 instance"
   default     = "sandbox"
 }
+
+variable "auto_stop_schedule" {
+  type        = string
+  description = "Cron expression (EventBridge Scheduler format) for automatically stopping the instance. Uses America/New_York timezone. Set to empty string to disable. Default: 6pm ET daily (weekdays and weekends)."
+  default     = "cron(0 18 * * ? *)"
+}
