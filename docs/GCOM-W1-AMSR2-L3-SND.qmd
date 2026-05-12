@@ -159,18 +159,44 @@ Key HDF5 global attributes include:
 The files do not embed coordinate variables, so latitude and longitude arrays
 must be constructed from the known EQR grid parameters.
 
+The `open_amsr2_snd()` function accepts either a local file path or an HTTPS
+URL. It uses [`obstore.fsspec.FsspecStore`](https://developmentseed.org/obstore/latest/api/fsspec/)
+to provide a seekable file-like object to `h5py`:
+
+- Local paths → `FsspecStore("file")` (requires an absolute path)
+- HTTPS URLs → `FsspecStore("https")`
+
 ```{python}
+import os
+import time
 import numpy as np
 import h5py
 import xarray as xr
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from pathlib import Path
+from obstore.fsspec import FsspecStore
 ```
 
 ```{python}
+def _open_h5_fileobj(path: str | Path):
+    """
+    Return a seekable file-like object for an AMSR2 HDF5 file using obstore.fsspec.
+
+    Supports:
+      - Local paths (str or Path) → FsspecStore("file"), converted to absolute
+      - HTTPS URLs (str starting with "https://") → FsspecStore("https")
+    """
+    path = str(path)
+    if path.startswith("https://"):
+        fs = FsspecStore("https")
+        return fs.open(path, "rb")
+    else:
+        fs = FsspecStore("file")
+        return fs.open(os.path.abspath(path), "rb")
+
+
 def open_amsr2_snd(path: str | Path) -> xr.Dataset:
     """
     Open an AMSR2 L3 Snow Depth HDF5 file as an xarray Dataset.
@@ -181,21 +207,23 @@ def open_amsr2_snd(path: str | Path) -> xr.Dataset:
     Parameters
     ----------
     path : str or Path
-        Path to the .h5 file.
+        Local file path or HTTPS URL to the .h5 file.
 
     Returns
     -------
     xr.Dataset with variables:
-        - snow_depth  (lat, lon)  float32, cm
-        - quality_flag (lat, lon) int16
-        - time_offset  (lat, lon) float32, minutes from UTC midnight
+        - snow_depth   (lat, lon)  float32, cm
+        - quality_flag (lat, lon)  int16
+        - time_offset  (lat, lon)  float32, minutes from UTC midnight
     """
-    path = Path(path)
-    with h5py.File(path, "r") as f:
-        geo = f["Geophysical Data"][:]      # (nrow, ncol, 2) int16
-        ti = f["Time Information"][:]       # (nrow, ncol) int16
-        scale = float(f["Geophysical Data"].attrs["SCALE FACTOR"][0])
-        attrs = dict(f.attrs)
+    path_str = str(path)
+    source_name = path_str.split("/")[-1]  # basename for attrs
+    with _open_h5_fileobj(path) as fobj:
+        with h5py.File(fobj, "r") as f:
+            geo = f["Geophysical Data"][:]      # (nrow, ncol, 2) int16
+            ti = f["Time Information"][:]       # (nrow, ncol) int16
+            scale = float(f["Geophysical Data"].attrs["SCALE FACTOR"][0])
+            attrs = dict(f.attrs)
 
     nrow, ncol = geo.shape[:2]
 
@@ -258,7 +286,7 @@ def open_amsr2_snd(path: str | Path) -> xr.Dataset:
             "ObservationEndDateTime":   _str("ObservationEndDateTime"),
             "Resolution":             _str("Resolution"),
             "Projection":             _str("Projection"),
-            "source_file":            path.name,
+            "source_file":            source_name,
         },
     )
     return ds
@@ -359,6 +387,64 @@ The ascending–descending difference reflects:
   may respond differently to wet vs dry snow between the two observation times.
 - **Orbital coverage gaps**: pixels observed by only one orbit direction will
   appear as missing in the difference map.
+
+---
+
+## Local vs. remote access
+
+`open_amsr2_snd()` works identically with a local file path or a direct HTTPS
+URL. Here we demonstrate both and benchmark how long each takes to compute mean
+snow depth over Alaska (approximate bounding box: 54–72 °N, 188–230 °E).
+
+Because the HDF5 file must be read in full before subsetting (the EQR grid has
+no chunking metadata exposed via HTTP range requests), remote access is
+significantly slower than local access for this product.
+
+```{python}
+# Alaska bounding box in EQR grid indices (HG 0.1° resolution)
+# lat 54–72 N  →  row 180–360  (row 0 = 89.95 N, step = 0.1°)
+# lon 188–230 E → col 1880–2300 (col 0 = 0.05 E, step = 0.1°)
+AK_ROWS = slice(180, 360)
+AK_COLS = slice(1880, 2300)
+
+LOCAL_PATH = "../_data/amsr2/GW1AM2_20260507_01D_EQMA_L3SGSNDHG2210210.h5"
+REMOTE_URL = (
+    "https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2"
+    "/L3.SND_10/2/2026/05/GW1AM2_20260507_01D_EQMA_L3SGSNDHG2210210.h5"
+)
+
+
+def alaska_mean_snd(path):
+    """Return mean snow depth (cm) over Alaska from an AMSR2 HG file."""
+    with _open_h5_fileobj(path) as fobj:
+        with h5py.File(fobj, "r") as f:
+            scale = float(f["Geophysical Data"].attrs["SCALE FACTOR"][0])
+            raw = f["Geophysical Data"][AK_ROWS, AK_COLS, 0]
+    snd = raw.astype(np.float32) * scale
+    snd[raw <= -32767] = np.nan
+    return float(np.nanmean(snd))
+
+
+# ── local benchmark ────────────────────────────────────────────────────────────
+t0 = time.perf_counter()
+mean_local = alaska_mean_snd(LOCAL_PATH)
+t_local = time.perf_counter() - t0
+
+# ── remote benchmark ───────────────────────────────────────────────────────────
+t0 = time.perf_counter()
+mean_remote = alaska_mean_snd(REMOTE_URL)
+t_remote = time.perf_counter() - t0
+
+print(f"Local  — mean snow depth over Alaska: {mean_local:.2f} cm  ({t_local:.2f} s)")
+print(f"Remote — mean snow depth over Alaska: {mean_remote:.2f} cm  ({t_remote:.2f} s)")
+print(f"Remote / local speed ratio: {t_remote / t_local:.1f}×")
+```
+
+The values are identical; the difference is only in transfer time. Remote
+access downloads the entire file before HDF5 can parse the dataset, so it is
+much slower for a single-variable subset. For repeated or interactive queries,
+downloading files locally first (as shown in the *Downloading files* section)
+is strongly recommended.
 
 ---
 
