@@ -66,6 +66,11 @@ zarr = ">=3.1.6,<4"
 satpy = ">=0.60.0,<0.61"
 sliderule = ">=5.3.1,<6"
 cartopy = ">=0.25.0,<0.26"
+quarto = ">=1.9.37,<2"
+jupyter = ">=1.1.1,<2"
+nbformat = ">=5.10.4,<6"
+nbclient = ">=0.10.4,<0.11"
+ipykernel = ">=7.2.0,<8"
 
 [tool.pixi.feature.dev.dependencies]
 ipython = "*"

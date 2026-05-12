@@ -1,3 +1,10 @@
+# Quarto outputs
+docs/_site/
+docs/.quarto/
+docs/*_files/
+docs/*.html
+docs/*-jupyter-*
+
 # Terraform outputs
 _aws-sandbox/_tfout.json
 

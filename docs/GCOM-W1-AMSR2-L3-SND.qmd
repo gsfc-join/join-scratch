@@ -1,0 +1,369 @@
+---
+title: "GCOM-W1 AMSR2 L3 Snow Depth"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Overview
+
+The **GCOM-W1 AMSR2 L3 Snow Depth** product (product ID `L3.SND_10`) is a daily
+gridded snow depth dataset derived from passive microwave brightness temperatures
+measured by the **Advanced Microwave Scanning Radiometer 2 (AMSR2)** onboard
+JAXA's **Global Change Observation Mission – Water 1 (GCOM-W1)** satellite.
+
+| Attribute | Value |
+|---|---|
+| Satellite | GCOM-W1 |
+| Sensor | AMSR2 |
+| Processing level | L3 (gridded, daily) |
+| Projection | Equi-Rectangular (EQR) |
+| Temporal resolution | Daily, monthly |
+| Low-resolution (LG) | 0.25° (~28 km), 720 × 1440 grid, lat 90°N–90°S, lon 0°–360° |
+| High-resolution (HG) | 0.10° (~11 km), 1800 × 3600 grid, lat 90°N–90°S, lon 0°–360° |
+| Primary variable | Snow depth (cm) |
+| Fill value (missing/cloudy) | –32768 × 0.1 |
+| Fill value (ocean/no obs) | –32767 × 0.1 |
+| Data format | HDF5 (`.h5`) |
+| Orbit directions | Ascending (**EQMA**) and Descending (**EQMD**) |
+
+AMSR2 observes each location twice per day at different local solar times:
+
+- **Ascending orbits (EQMA)**: equator crossing ~13:30 local time (daytime)
+- **Descending orbits (EQMD)**: equator crossing ~01:30 local time (nighttime)
+
+Each daily granule aggregates all passes in one orbit direction over 24 hours.
+Snow depth is retrieved using the brightness temperature difference algorithm
+described in the AMSR2 Higher Level Product Format Guide (JAXA, 2022).
+
+---
+
+## Downloading files
+
+Files are distributed through the
+[JAXA G-Portal](https://gportal.jaxa.jp/) archive. No authentication is
+required for direct downloads with `curl`.
+
+URL structure:
+
+```
+https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2/L3.SND_10/2/
+  {YYYY}/{MM}/GW1AM2_{YYYYMMDD}_01D_{ORBIT}_L3SGSNDHG2210210.h5
+```
+
+where `{ORBIT}` is `EQMA` (ascending) or `EQMD` (descending).
+
+The following script downloads a set of daily HG files for a date range, skipping
+files that already exist locally (`-C -` resumes partial downloads and combined
+with `-o` will not re-download complete files; alternatively `-z` skips if the
+remote file is not newer than the local copy).
+
+```{bash}
+#| eval: false
+OUTDIR="_data/amsr2"
+mkdir -p "$OUTDIR"
+
+# Define dates and orbit directions to download
+DATES=(
+  "2026/05/20260505"
+  "2026/05/20260506"
+  "2026/05/20260507"
+  "2026/05/20260510"
+)
+ORBITS=("EQMA" "EQMD")
+
+BASE="https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2/L3.SND_10/2"
+
+for DATE_PATH in "${DATES[@]}"; do
+  YYYYMM="${DATE_PATH%/*}"   # e.g. 2026/05
+  YYYYMMDD="${DATE_PATH##*/}" # e.g. 20260505
+  for ORBIT in "${ORBITS[@]}"; do
+    FNAME="GW1AM2_${YYYYMMDD}_01D_${ORBIT}_L3SGSNDHG2210210.h5"
+    FPATH="$OUTDIR/$FNAME"
+    if [ -f "$FPATH" ]; then
+      echo "Already exists, skipping: $FNAME"
+    else
+      URL="${BASE}/${YYYYMM}/${FNAME}"
+      echo "Downloading: $FNAME"
+      curl -L -o "$FPATH" "$URL"
+    fi
+  done
+done
+```
+
+> **Note**: G-Portal may occasionally require a login session for bulk or
+> programmatic downloads. If `curl` returns an HTML login page instead of an
+> HDF5 file, log in at <https://gportal.jaxa.jp/> in your browser, export your
+> session cookies to a file, and pass `--cookie cookies.txt` to `curl`.
+
+---
+
+## File naming convention
+
+```
+GW1AM2_{YYYYMMDD}_{DUR}_{ORBIT}_{PRODUCT}{VER}.h5
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `GW1AM2` | — | GCOM-W1 / AMSR2 |
+| `YYYYMMDD` | `20260507` | Observation date |
+| `DUR` | `01D` / `01M` | Duration: daily / monthly |
+| `ORBIT` | `EQMA` / `EQMD` | Ascending / descending orbit |
+| `PRODUCT` | `L3SGSND` | L3 Snow Depth |
+| `LG`/`HG` | — | Low-gain (0.25°) / High-gain (0.10°) |
+| `VER` | `2210210` | Algorithm + product version |
+
+---
+
+## File contents
+
+Each file is an HDF5 file with two top-level groups:
+
+### `Geophysical Data`
+
+Shape: `(nrow, ncol, 2)`, dtype `int16`
+
+- **Band 0 — Snow Depth**: physical value = `raw × 0.1` (cm). Values of
+  `-32768 × 0.1` indicate missing/cloudy pixels; `-32767 × 0.1` indicate ocean
+  or pixels with no observation.
+- **Band 1 — Quality Flag**: integer quality/algorithm flag (see product guide
+  for flag definitions). Same fill values apply.
+
+### `Time Information`
+
+Shape: `(nrow, ncol)`, dtype `int16`, units: minutes (offset from UTC midnight
+of the observation date). Gives the time at which each pixel was last observed.
+
+### Global attributes
+
+Key HDF5 global attributes include:
+
+| Attribute | Example |
+|---|---|
+| `GranuleID` | `GW1AM2_20260507_01D_EQMD_L3SGSNDHG2210210` |
+| `ObservationStartDateTime` | `2026-05-07T00:21:44Z` |
+| `ObservationEndDateTime` | `2026-05-07T23:59:58Z` |
+| `OrbitDirection` | `Ascending` / `Descending` |
+| `Resolution` | `0.1deg` |
+| `Projection` | `EQR` |
+| `ProductVersion` | `2` |
+
+---
+
+## Opening files with xarray
+
+The files do not embed coordinate variables, so latitude and longitude arrays
+must be constructed from the known EQR grid parameters.
+
+```{python}
+import numpy as np
+import h5py
+import xarray as xr
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from pathlib import Path
+```
+
+```{python}
+def open_amsr2_snd(path: str | Path) -> xr.Dataset:
+    """
+    Open an AMSR2 L3 Snow Depth HDF5 file as an xarray Dataset.
+
+    Constructs EQR lat/lon coordinates from the grid shape, applies the
+    scale factor, and masks fill values.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the .h5 file.
+
+    Returns
+    -------
+    xr.Dataset with variables:
+        - snow_depth  (lat, lon)  float32, cm
+        - quality_flag (lat, lon) int16
+        - time_offset  (lat, lon) float32, minutes from UTC midnight
+    """
+    path = Path(path)
+    with h5py.File(path, "r") as f:
+        geo = f["Geophysical Data"][:]      # (nrow, ncol, 2) int16
+        ti = f["Time Information"][:]       # (nrow, ncol) int16
+        scale = float(f["Geophysical Data"].attrs["SCALE FACTOR"][0])
+        attrs = dict(f.attrs)
+
+    nrow, ncol = geo.shape[:2]
+
+    # EQR grid: cell centres, north-to-south, west-to-east
+    # Longitude origin is 0° (Greenwich), running 0–360° eastward.
+    res = 180.0 / nrow  # degrees per pixel
+    lats = np.linspace(90.0 - res / 2, -90.0 + res / 2, nrow)
+    lons = np.linspace(res / 2, 360.0 - res / 2, ncol)
+
+    FILL_MISSING = -32768
+    FILL_NOOBS   = -32767
+
+    def apply_scale(arr, fill_val=FILL_MISSING):
+        out = arr.astype(np.float32) * scale
+        out[arr == FILL_MISSING] = np.nan
+        out[arr == FILL_NOOBS]   = np.nan
+        return out
+
+    snow_depth  = apply_scale(geo[:, :, 0])
+    qual_raw    = geo[:, :, 1].copy()
+    qual_raw[qual_raw == FILL_MISSING] = -1
+    qual_raw[qual_raw == FILL_NOOBS]   = -1
+    time_offset = apply_scale(ti)
+
+    # Extract useful metadata from HDF5 global attributes
+    def _str(a):
+        v = attrs.get(a, [""])[0]
+        return v.decode() if isinstance(v, bytes) else str(v)
+
+    ds = xr.Dataset(
+        {
+            "snow_depth": xr.DataArray(
+                snow_depth,
+                dims=["lat", "lon"],
+                attrs={
+                    "long_name": "Snow Depth",
+                    "units": "cm",
+                    "scale_factor_original": scale,
+                },
+            ),
+            "quality_flag": xr.DataArray(
+                qual_raw,
+                dims=["lat", "lon"],
+                attrs={"long_name": "Quality Flag", "_FillValue": -1},
+            ),
+            "time_offset": xr.DataArray(
+                time_offset,
+                dims=["lat", "lon"],
+                attrs={"long_name": "Observation time offset from UTC midnight", "units": "minutes"},
+            ),
+        },
+        coords={
+            "lat": xr.DataArray(lats, dims=["lat"], attrs={"units": "degrees_north"}),
+            "lon": xr.DataArray(lons, dims=["lon"], attrs={"units": "degrees_east"}),
+        },
+        attrs={
+            "GranuleID":              _str("GranuleID"),
+            "OrbitDirection":         _str("OrbitDirection"),
+            "ObservationStartDateTime": _str("ObservationStartDateTime"),
+            "ObservationEndDateTime":   _str("ObservationEndDateTime"),
+            "Resolution":             _str("Resolution"),
+            "Projection":             _str("Projection"),
+            "source_file":            path.name,
+        },
+    )
+    return ds
+```
+
+Load a pair of ascending and descending files for the same date:
+
+```{python}
+data_dir = Path("../_data/amsr2")
+date = "20260507"
+
+ds_asc  = open_amsr2_snd(data_dir / f"GW1AM2_{date}_01D_EQMA_L3SGSNDHG2210210.h5")
+ds_desc = open_amsr2_snd(data_dir / f"GW1AM2_{date}_01D_EQMD_L3SGSNDHG2210210.h5")
+
+print("Ascending orbit:")
+print(ds_asc)
+print("\nDescending orbit:")
+print(ds_desc)
+```
+
+---
+
+## Global visualization
+
+Plot the snow depth for both orbit directions and their difference for
+**{python} date**.
+
+```{python}
+#| fig-cap: "AMSR2 L3 Snow Depth — ascending orbit (top), descending orbit (middle), and difference (bottom). Date: 2026-05-07."
+#| fig-width: 12
+#| fig-height: 14
+
+proj = ccrs.PlateCarree()
+
+# ── colour scales ─────────────────────────────────────────────────────────────
+snd_cmap   = plt.get_cmap("Blues")
+diff_cmap  = plt.get_cmap("RdBu_r")
+
+snd_vmin,  snd_vmax  = 0,   100    # cm
+diff_vmax = 30                      # ± cm symmetric
+
+fig, axes = plt.subplots(
+    3, 1,
+    figsize=(12, 14),
+    subplot_kw={"projection": proj},
+)
+
+panels = [
+    (ds_asc,  "Ascending (EQMA) — ~13:30 LT",  snd_cmap,  snd_vmin,  snd_vmax),
+    (ds_desc, "Descending (EQMD) — ~01:30 LT", snd_cmap,  snd_vmin,  snd_vmax),
+    (None,    "Difference (Ascending − Descending)", diff_cmap, -diff_vmax, diff_vmax),
+]
+
+for ax, (ds, title, cmap, vmin, vmax) in zip(axes, panels):
+    ax.set_global()
+    ax.add_feature(cfeature.LAND,        facecolor="lightgrey", zorder=0)
+    ax.add_feature(cfeature.OCEAN,       facecolor="white",     zorder=0)
+    ax.add_feature(cfeature.COASTLINE,   linewidth=0.4,         zorder=2)
+    ax.add_feature(cfeature.BORDERS,     linewidth=0.3,         zorder=2)
+    ax.gridlines(draw_labels=False, linewidth=0.3, color="grey", alpha=0.5)
+
+    if ds is not None:
+        snd = ds["snow_depth"].values
+    else:
+        snd = ds_asc["snow_depth"].values - ds_desc["snow_depth"].values
+
+    # Only plot pixels where snow depth > 0 (or any finite value for difference)
+    lons_1d = ds_asc["lon"].values
+    lats_1d = ds_asc["lat"].values
+
+    im = ax.pcolormesh(
+        lons_1d, lats_1d, snd,
+        cmap=cmap, vmin=vmin, vmax=vmax,
+        transform=proj, rasterized=True, zorder=1,
+    )
+
+    plt.colorbar(im, ax=ax, orientation="vertical", pad=0.02,
+                 label="Snow Depth (cm)" if ds is not None else "Difference (cm)",
+                 shrink=0.7)
+    ax.set_title(title, fontsize=11, pad=6)
+
+fig.suptitle(
+    f"GCOM-W1 AMSR2 L3 Snow Depth  |  {date[:4]}-{date[4:6]}-{date[6:]}",
+    fontsize=13, y=0.98,
+)
+fig.tight_layout()
+plt.show()
+```
+
+### Interpreting the difference map
+
+The ascending–descending difference reflects:
+
+- **Diurnal snow melt/metamorphism**: daytime warming (ascending, ~13:30 LT)
+  can reduce observed snow depth relative to the pre-dawn (descending, ~01:30 LT)
+  pass.
+- **Algorithm sensitivity**: the brightness-temperature difference algorithm
+  may respond differently to wet vs dry snow between the two observation times.
+- **Orbital coverage gaps**: pixels observed by only one orbit direction will
+  appear as missing in the difference map.
+
+---
+
+## References
+
+- JAXA (2022). *AMSR2 Higher Level Product Format Description (EN)*. G-Portal.
+  <https://gportal.jaxa.jp/gpr/assets/mng_upload/GCOM-W/AMSR2_Higher_Level_Product_Format_EN.pdf>
+- G-Portal data access: <https://gportal.jaxa.jp/>
