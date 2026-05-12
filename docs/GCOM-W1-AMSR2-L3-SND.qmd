@@ -167,8 +167,10 @@ to provide a seekable file-like object to `h5py`:
 - HTTPS URLs → `FsspecStore("https")`
 
 ```{python}
+import io
 import os
 import time
+import urllib.request
 import numpy as np
 import h5py
 import xarray as xr
@@ -177,27 +179,85 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from pathlib import Path
 from obstore.fsspec import FsspecStore
+import obstore
+from obstore.store import HTTPStore
 ```
 
 ```{python}
-def _open_h5_fileobj(path: str | Path):
+def _open_h5_fileobj(path: str | Path, access_options: dict | None = None):
     """
-    Return a seekable file-like object for an AMSR2 HDF5 file using obstore.fsspec.
+    Return a seekable file-like object for an AMSR2 HDF5 file.
 
-    Supports:
-      - Local paths (str or Path) → FsspecStore("file"), converted to absolute
-      - HTTPS URLs (str starting with "https://") → FsspecStore("https")
+    For local paths, ``access_options`` is ignored and the file is opened
+    directly.  For HTTPS URLs, ``access_options`` controls how the file is
+    fetched.  It must be a dict with exactly one of the following keys:
+
+    ``{"obstore_fsspec": {}}``
+        Stream lazily via :class:`obstore.fsspec.FsspecStore` (default).
+        The value dict is forwarded as keyword arguments to
+        ``FsspecStore("https")``.
+
+    ``{"obstore_stream": {}}``
+        Download the entire file into an in-memory ``io.BytesIO`` buffer
+        using :func:`obstore.get`, then open it from memory.  This pays a
+        higher upfront cost but avoids many small HTTP range requests when
+        HDF5 reads the dataset.  The value dict is forwarded as keyword
+        arguments to ``HTTPStore.from_url()``.
+
+    ``{"local_cache": {"dir": "/path/to/folder"}}``
+        Download the file to *dir* (if not already present) and open the
+        local copy.  Subsequent calls with the same file reuse the cached
+        copy at local-disk speed.
     """
     path = str(path)
-    if path.startswith("https://"):
-        fs = FsspecStore("https")
-        return fs.open(path, "rb")
-    else:
+    if not path.startswith("https://"):
+        # Local file — access_options irrelevant
         fs = FsspecStore("file")
         return fs.open(os.path.abspath(path), "rb")
 
+    if access_options is None:
+        access_options = {"obstore_fsspec": {}}
 
-def open_amsr2_snd(path: str | Path) -> xr.Dataset:
+    mode, opts = next(iter(access_options.items()))
+
+    if mode == "obstore_fsspec":
+        fs = FsspecStore("https", **opts)
+        return fs.open(path, "rb")
+
+    elif mode == "obstore_stream":
+        # Parse base URL and object path
+        from urllib.parse import urlsplit
+        parts = urlsplit(path)
+        base_url = f"{parts.scheme}://{parts.netloc}"
+        obj_path = parts.path.lstrip("/")
+        store = HTTPStore.from_url(base_url, **opts)
+        data = obstore.get(store, obj_path).bytes()
+        buf = io.BytesIO(bytes(data))
+        # Return a context manager wrapper so callers can use "with" syntax
+        class _CM:
+            def __enter__(self_):  return buf
+            def __exit__(self_, *a): buf.close()
+        return _CM()
+
+    elif mode == "local_cache":
+        cache_dir = Path(opts.get("dir", "."))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        filename = path.split("/")[-1]
+        local_path = cache_dir / filename
+        if not local_path.exists():
+            print(f"Downloading {filename} to {cache_dir} …")
+            urllib.request.urlretrieve(path, local_path)
+        fs = FsspecStore("file")
+        return fs.open(str(local_path.resolve()), "rb")
+
+    else:
+        raise ValueError(
+            f"Unknown access_options mode {mode!r}. "
+            "Expected 'obstore_fsspec', 'obstore_stream', or 'local_cache'."
+        )
+
+
+def open_amsr2_snd(path: str | Path, access_options: dict | None = None) -> xr.Dataset:
     """
     Open an AMSR2 L3 Snow Depth HDF5 file as an xarray Dataset.
 
@@ -208,6 +268,9 @@ def open_amsr2_snd(path: str | Path) -> xr.Dataset:
     ----------
     path : str or Path
         Local file path or HTTPS URL to the .h5 file.
+    access_options : dict or None
+        Controls how remote files are accessed.  Ignored for local paths.
+        See :func:`_open_h5_fileobj` for details.
 
     Returns
     -------
@@ -218,7 +281,7 @@ def open_amsr2_snd(path: str | Path) -> xr.Dataset:
     """
     path_str = str(path)
     source_name = path_str.split("/")[-1]  # basename for attrs
-    with _open_h5_fileobj(path) as fobj:
+    with _open_h5_fileobj(path, access_options) as fobj:
         with h5py.File(fobj, "r") as f:
             geo = f["Geophysical Data"][:]      # (nrow, ncol, 2) int16
             ti = f["Time Information"][:]       # (nrow, ncol) int16
@@ -392,13 +455,19 @@ The ascending–descending difference reflects:
 
 ## Local vs. remote access
 
-`open_amsr2_snd()` works identically with a local file path or a direct HTTPS
-URL. Here we demonstrate both and benchmark how long each takes to compute mean
-snow depth over Alaska (approximate bounding box: 54–72 °N, 188–230 °E).
+`open_amsr2_snd()` accepts an optional `access_options` argument that controls
+how remote HTTPS files are fetched.  Three strategies are available:
 
-Because the HDF5 file must be read in full before subsetting (the EQR grid has
-no chunking metadata exposed via HTTP range requests), remote access is
-significantly slower than local access for this product.
+| `access_options` key | Description |
+|---|---|
+| `"obstore_fsspec"` (default) | Lazy streaming via `obstore.fsspec` — sends many small HTTP range requests as HDF5 navigates the file. |
+| `"obstore_stream"` | Bulk-download the entire file into memory first (`obstore.get`), then open from `io.BytesIO`.  One large request instead of hundreds of small ones. |
+| `"local_cache"` | Download the file to a local directory (if not already cached), then open from disk.  Fastest for repeated access. |
+
+For local paths the argument is ignored; the file is always opened directly.
+
+Here we benchmark all four scenarios (local + three remote modes) for computing
+mean snow depth over Alaska (approx. 54–72 °N, 188–230 °E in EQR coordinates).
 
 ```{python}
 # Alaska bounding box in EQR grid indices (HG 0.1° resolution)
@@ -412,11 +481,12 @@ REMOTE_URL = (
     "https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2"
     "/L3.SND_10/2/2026/05/GW1AM2_20260507_01D_EQMA_L3SGSNDHG2210210.h5"
 )
+CACHE_DIR = "/tmp/amsr2_cache"
 
 
-def alaska_mean_snd(path):
+def alaska_mean_snd(path, access_options=None):
     """Return mean snow depth (cm) over Alaska from an AMSR2 HG file."""
-    with _open_h5_fileobj(path) as fobj:
+    with _open_h5_fileobj(path, access_options) as fobj:
         with h5py.File(fobj, "r") as f:
             scale = float(f["Geophysical Data"].attrs["SCALE FACTOR"][0])
             raw = f["Geophysical Data"][AK_ROWS, AK_COLS, 0]
@@ -425,26 +495,35 @@ def alaska_mean_snd(path):
     return float(np.nanmean(snd))
 
 
-# ── local benchmark ────────────────────────────────────────────────────────────
-t0 = time.perf_counter()
-mean_local = alaska_mean_snd(LOCAL_PATH)
-t_local = time.perf_counter() - t0
+scenarios = [
+    ("local disk",        LOCAL_PATH,  None),
+    ("remote fsspec",     REMOTE_URL,  {"obstore_fsspec": {}}),
+    ("remote stream",     REMOTE_URL,  {"obstore_stream": {}}),
+    ("remote local_cache",REMOTE_URL,  {"local_cache": {"dir": CACHE_DIR}}),
+]
 
-# ── remote benchmark ───────────────────────────────────────────────────────────
-t0 = time.perf_counter()
-mean_remote = alaska_mean_snd(REMOTE_URL)
-t_remote = time.perf_counter() - t0
+results = []
+for label, path, opts in scenarios:
+    t0 = time.perf_counter()
+    mean = alaska_mean_snd(path, opts)
+    elapsed = time.perf_counter() - t0
+    results.append((label, mean, elapsed))
+    print(f"{label:<22} — {mean:.2f} cm  ({elapsed:.2f} s)")
 
-print(f"Local  — mean snow depth over Alaska: {mean_local:.2f} cm  ({t_local:.2f} s)")
-print(f"Remote — mean snow depth over Alaska: {mean_remote:.2f} cm  ({t_remote:.2f} s)")
-print(f"Remote / local speed ratio: {t_remote / t_local:.1f}×")
+t_local = results[0][2]
+print()
+for label, mean, elapsed in results[1:]:
+    print(f"  {label:<22}: {elapsed / t_local:.1f}× slower than local disk")
 ```
 
-The values are identical; the difference is only in transfer time. Remote
-access downloads the entire file before HDF5 can parse the dataset, so it is
-much slower for a single-variable subset. For repeated or interactive queries,
-downloading files locally first (as shown in the *Downloading files* section)
-is strongly recommended.
+All strategies return the same snow-depth value; the difference is latency:
+
+- **`obstore_fsspec`** sends many small HTTP range requests as the HDF5 library
+  navigates the file structure.  Network round-trip latency dominates.
+- **`obstore_stream`** makes one large HTTP request and reads from memory.
+  Much faster than fsspec for HDF5 files that lack cloud-optimised chunking.
+- **`local_cache`** downloads once and re-uses the local copy.  Subsequent
+  calls match local-disk speed.
 
 ---
 
