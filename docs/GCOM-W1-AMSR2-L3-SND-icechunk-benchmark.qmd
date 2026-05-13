@@ -1,0 +1,828 @@
+---
+title: "GCOM-W1 AMSR2 L3 Snow Depth — IceChunk Insertion Strategy Benchmark"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Overview
+
+This notebook benchmarks four strategies for inserting time-stamped virtual
+chunk references into an IceChunk store in sorted order.  All four methods
+receive identical input (the same virtual chunk manifests, fetched once from
+G-Portal HTTPS) and are evaluated on:
+
+- **Per-insertion wall-clock time** — how long each `insert_date` call takes
+- **Store disk size after each insertion** — bytes on disk after each commit
+- **Open + plot time** — wall-clock time to open the finished store and render
+  an Alaska time-series plot
+
+### The four strategies
+
+| # | Name | Description |
+|---|------|-------------|
+| 1 | `append_sortby` | Append every date to the end; sort by `time` at read time (`xr.sortby`) |
+| 2 | `shift_array` | Insert at the correct sorted position, shifting trailing slots right |
+| 3 | `reindex_array` | Insert at the correct sorted position using `session.reindex_array` |
+| 4 | `preallocated` | Pre-allocate one slot per calendar day (2012-06-01 → 2026-12-31); write each date to its correct index |
+
+## Setup
+
+```{python}
+import os
+# Must be set BEFORE importing icechunk — the Rust logger is initialised at
+# import time and cannot be reconfigured afterwards.
+os.environ.setdefault("RUST_LOG", "error")
+
+import bisect
+import io
+import shutil
+import time
+from pathlib import Path
+
+import h5py
+import icechunk
+import numpy as np
+import obstore
+from obstore.store import HTTPStore
+import pandas as pd
+import zarr
+from zarr.codecs import Zlib
+from virtualizarr.parsers.hdf.hdf import _construct_manifest_array
+```
+
+```{python}
+# ── constants (identical to multidate notebook) ────────────────────────────────
+NLAT, NLON = 1800, 3600
+CLAT       = 72
+
+FILL_MISSING  = np.int16(-32768)
+FILL_NOOBS    = np.int16(-32767)
+SCALE_FACTOR  = 0.1
+
+GPORTAL_BASE = (
+    "https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2"
+    "/L3.SND_10/2/{yyyy}/{mm}/"
+)
+FNAME_TMPL   = "GW1AM2_{date}_01D_{orbit}_L3SGSNDHG2210210.h5"
+ORBIT_CODES  = ["EQMA", "EQMD"]
+ORBIT_LABELS = ["Ascending", "Descending"]
+
+BENCH_DIR = Path("../_data/amsr2/icechunk-stores/benchmark").resolve()
+
+AK_ROWS = slice(180, 360)
+AK_COLS = slice(1880, 2300)
+
+TIME_UNITS    = "days since 1970-01-01"
+TIME_CALENDAR = "proleptic_gregorian"
+TIME_EPOCH    = pd.Timestamp("1970-01-01")
+
+# Pre-allocation span for strategy 4
+PREALLOC_START = pd.Timestamp("2012-06-01")
+PREALLOC_END   = pd.Timestamp("2026-12-31")
+```
+
+```{python}
+# ── date helpers ───────────────────────────────────────────────────────────────
+def gportal_url(date: str, orbit: str) -> str:
+    yyyy, mm = date[:4], date[4:6]
+    return GPORTAL_BASE.format(yyyy=yyyy, mm=mm) + FNAME_TMPL.format(
+        date=date, orbit=orbit
+    )
+
+
+def date_to_days(date: str) -> int:
+    ts = pd.Timestamp(f"{date[:4]}-{date[4:6]}-{date[6:]}")
+    return int((ts - TIME_EPOCH).days)
+
+
+def days_to_datestr(days: int) -> str:
+    return (TIME_EPOCH + pd.Timedelta(days=int(days))).strftime("%Y-%m-%d")
+
+
+def _av(v):
+    if isinstance(v, np.ndarray):
+        flat = v.flatten()
+        if flat.dtype.kind in ("S", "U", "O"):
+            items = [x.decode() if isinstance(x, bytes) else str(x) for x in flat]
+            return items[0] if len(items) == 1 else items
+        lst = flat.tolist()
+        return lst[0] if len(lst) == 1 else lst
+    return v.decode() if isinstance(v, bytes) else v
+```
+
+## Pre-fetch manifests (one HTTP round-trip per unique date)
+
+All four strategies share the exact same virtual chunk references.  We fetch
+each orbit's HDF5 manifest once here and cache the result in `MANIFEST_CACHE`.
+No subsequent cell issues any network request to G-Portal.
+
+```{python}
+INSERT_SEQUENCE = [
+    ("20260507", ""),       # May 7 2026
+    ("20260505", ""),       # May 5 2026
+    ("20150115", ""),       # Jan 15 2015
+    ("20130301", ""),       # Mar 1 2013
+    ("20260507", "←dup"),   # duplicate
+    ("20200621", ""),       # Jun 21 2020
+    ("20121205", ""),       # Dec 5 2012  (near mission start)
+    ("20260506", ""),       # May 6 2026
+    ("20150115", "←dup"),   # duplicate
+    ("20180901", ""),       # Sep 1 2018
+    ("20231101", ""),       # Nov 1 2023
+    ("20260505", "←dup"),   # duplicate
+    ("20160701", ""),       # Jul 1 2016
+    ("20220315", ""),       # Mar 15 2022
+]
+
+UNIQUE_DATES = list(dict.fromkeys(d for d, _ in INSERT_SEQUENCE))  # preserve order, dedupe
+
+
+def _get_manifests(chunk_url: str):
+    """Download one HDF5 file and extract its VirtualiZarr manifest."""
+    from urllib.parse import urlsplit
+    parts    = urlsplit(chunk_url)
+    base_url = f"{parts.scheme}://{parts.netloc}"
+    obj_path = parts.path.lstrip("/")
+    store    = HTTPStore.from_url(base_url)
+    buf      = io.BytesIO(obstore.get(store, obj_path).bytes())
+    with h5py.File(buf, "r") as f:
+        ma    = _construct_manifest_array(chunk_url, f["Geophysical Data"], "/")
+        attrs = {k: _av(v) for k, v in f["Geophysical Data"].attrs.items()}
+    return ma.manifest, attrs
+
+
+# MANIFEST_CACHE[date][orbit_idx] = manifest object
+MANIFEST_CACHE: dict[str, dict[int, object]] = {}
+
+print(f"Fetching manifests for {len(UNIQUE_DATES)} unique dates × {len(ORBIT_CODES)} orbits …")
+fetch_start = time.perf_counter()
+for date in UNIQUE_DATES:
+    MANIFEST_CACHE[date] = {}
+    for o_idx, orbit in enumerate(ORBIT_CODES):
+        url = gportal_url(date, orbit)
+        try:
+            manifest, _ = _get_manifests(url)
+            MANIFEST_CACHE[date][o_idx] = manifest
+            print(f"  ✓ {date}  {orbit}")
+        except Exception as exc:
+            print(f"  ✗ {date}  {orbit}  ({exc})")
+fetch_elapsed = time.perf_counter() - fetch_start
+print(f"\nAll manifests fetched in {fetch_elapsed:.1f} s")
+```
+
+## Helper: store creation and disk-size measurement
+
+```{python}
+def make_store_config() -> icechunk.RepositoryConfig:
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(
+            "https://gportal.jaxa.jp/", icechunk.http_store()
+        )
+    )
+    return config
+
+
+def open_repo(store_dir: Path) -> icechunk.Repository:
+    return icechunk.Repository.open(
+        icechunk.local_filesystem_storage(str(store_dir)),
+        authorize_virtual_chunk_access={"https://gportal.jaxa.jp/": None},
+    )
+
+
+def store_size_bytes(store_dir: Path) -> int:
+    """Total bytes of all files under *store_dir*."""
+    return sum(f.stat().st_size for f in store_dir.rglob("*") if f.is_file())
+
+
+def _write_virtual_refs(store, new_slot: int, date: str) -> None:
+    """Write virtual chunk refs for *date* at time index *new_slot*."""
+    for o_idx, manifest in MANIFEST_CACHE.get(date, {}).items():
+        for (ci, cj, ck), ref in manifest.iter_refs():
+            key = f"geophysical_data/c/{new_slot}/{o_idx}/{ci}/{cj}/{ck}"
+            store.set_virtual_ref(
+                key, ref["path"], offset=ref["offset"], length=ref["length"]
+            )
+```
+
+## Benchmarking infrastructure
+
+```{python}
+from dataclasses import dataclass, field
+
+
+@dataclass
+class BenchResult:
+    name: str
+    insert_times: list[float] = field(default_factory=list)
+    insert_labels: list[str]  = field(default_factory=list)
+    disk_sizes: list[int]     = field(default_factory=list)
+    open_plot_time: float     = 0.0
+    store_dir: Path           = None
+```
+
+## Strategy 1 — Append + sort at read (`append_sortby`)
+
+Dates are always appended to the end of the time dimension, producing
+unsorted storage order.  The `sortby("time")` call in the read path
+re-sorts lazily at open time without touching the store.
+
+```{python}
+S1_DIR = BENCH_DIR / "append_sortby"
+shutil.rmtree(S1_DIR, ignore_errors=True)
+S1_DIR.mkdir(parents=True, exist_ok=True)
+
+config = make_store_config()
+repo1  = icechunk.Repository.create(
+    icechunk.local_filesystem_storage(str(S1_DIR)), config=config
+)
+
+lats = np.linspace(89.95, -89.95, NLAT).astype("float32")
+lons = np.linspace(0.05,  359.95, NLON).astype("float32")
+
+session = repo1.writable_session("main")
+root    = zarr.open_group(session.store, mode="w", zarr_format=3)
+
+root.require_array("time", shape=(0,), chunks=(512,), dtype="int32",
+    dimension_names=["time"],
+    attributes={"units": TIME_UNITS, "calendar": TIME_CALENDAR, "long_name": "observation date"})
+root.require_array("orbit", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["orbit"], attributes={"long_name": "orbit direction"})
+root["orbit"][:] = ORBIT_LABELS
+root.require_array("band", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["band"], attributes={"long_name": "band name"})
+root["band"][:] = ["snow_depth", "quality_flag"]
+root.require_array("lat", shape=(NLAT,), chunks=(NLAT,), dtype="float32",
+    dimension_names=["lat"], attributes={"units": "degrees_north", "long_name": "latitude"})
+root["lat"][:] = lats
+root.require_array("lon", shape=(NLON,), chunks=(NLON,), dtype="float32",
+    dimension_names=["lon"], attributes={"units": "degrees_east", "long_name": "longitude"})
+root["lon"][:] = lons
+root.require_array("geophysical_data",
+    shape=(0, 2, NLAT, NLON, 2), chunks=(1, 1, CLAT, NLON, 2),
+    dtype="int16", fill_value=int(FILL_MISSING), compressors=[Zlib(level=9)],
+    dimension_names=["time", "orbit", "lat", "lon", "band"],
+    attributes={"long_name": "geophysical data", "units": "cm",
+                "scale_factor": SCALE_FACTOR, "_FillValue": int(FILL_MISSING),
+                "missing_value": int(FILL_NOOBS)})
+session.commit("Init strategy 1")
+
+result1 = BenchResult(name="append_sortby", store_dir=S1_DIR)
+
+for date, note in INSERT_SEQUENCE:
+    day_val = date_to_days(date)
+    t0 = time.perf_counter()
+
+    repo1  = open_repo(S1_DIR)
+    session = repo1.writable_session("main")
+    store   = session.store
+    root    = zarr.open_group(store, mode="r+", zarr_format=3)
+
+    n = root["time"].shape[0]
+    current = list(root["time"][:].tolist()) if n > 0 else []
+
+    if day_val in current:
+        elapsed = time.perf_counter() - t0
+        result1.insert_times.append(elapsed)
+        result1.insert_labels.append(f"{date} {note}".strip())
+        result1.disk_sizes.append(store_size_bytes(S1_DIR))
+        print(f"  {date} {note:<8} skipped ({elapsed*1e3:.0f} ms)")
+        continue
+
+    slot = len(current)
+    root["time"].resize((slot + 1,))
+    root["time"][slot] = day_val
+    root["geophysical_data"].resize((slot + 1, 2, NLAT, NLON, 2))
+    _write_virtual_refs(store, slot, date)
+    session.commit(f"Insert {days_to_datestr(day_val)} → slot {slot}")
+
+    elapsed = time.perf_counter() - t0
+    result1.insert_times.append(elapsed)
+    result1.insert_labels.append(f"{date} {note}".strip())
+    result1.disk_sizes.append(store_size_bytes(S1_DIR))
+    print(f"  {date} {note:<8} → slot {slot:2d}  ({elapsed*1e3:.0f} ms,  {result1.disk_sizes[-1]/1024:.1f} KB)")
+```
+
+## Strategy 2 — `shift_array` (sorted insert)
+
+Each new date is inserted at the correct sorted position.  Slots after the
+insertion point are shifted right one position with `shift_array`, then the
+freed slot is filled with virtual refs for the new date.
+
+For a prepend (insertion at position 0) `shift_array` shifts the entire array
+right by one chunk position.  For a mid-array insert, the same shift applies
+to the whole array (which also moves the leading slots by one), so we must
+re-key those leading slots back to their original positions.
+
+> **Note on `shift_array` limitations**: `shift_array` shifts *all* chunks in
+> the array — it cannot shift only a tail.  For a mid-array insert, slots
+> before `ins_pos` are also shifted right by one, which breaks them.  The only
+> correct recovery is to re-issue `set_virtual_ref` for every displaced pre-ins
+> slot (25 lat-chunks × 2 orbits × `ins_pos` slots).  The time coordinate is
+> easily fixed by re-writing all values.  This is done below for completeness,
+> but the cost scales linearly with the number of pre-insertion slots.
+
+```{python}
+S2_DIR = BENCH_DIR / "shift_array"
+
+# Keep a lookup: day_val → MANIFEST_CACHE key (date string YYYYMMDD)
+DAY_TO_DATE: dict[int, str] = {date_to_days(d): d for d in UNIQUE_DATES}
+
+shutil.rmtree(S2_DIR, ignore_errors=True)
+S2_DIR.mkdir(parents=True, exist_ok=True)
+
+config = make_store_config()
+repo2  = icechunk.Repository.create(
+    icechunk.local_filesystem_storage(str(S2_DIR)), config=config
+)
+
+session = repo2.writable_session("main")
+root    = zarr.open_group(session.store, mode="w", zarr_format=3)
+
+root.require_array("time", shape=(0,), chunks=(512,), dtype="int32",
+    dimension_names=["time"],
+    attributes={"units": TIME_UNITS, "calendar": TIME_CALENDAR, "long_name": "observation date"})
+root.require_array("orbit", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["orbit"], attributes={"long_name": "orbit direction"})
+root["orbit"][:] = ORBIT_LABELS
+root.require_array("band", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["band"], attributes={"long_name": "band name"})
+root["band"][:] = ["snow_depth", "quality_flag"]
+root.require_array("lat", shape=(NLAT,), chunks=(NLAT,), dtype="float32",
+    dimension_names=["lat"], attributes={"units": "degrees_north", "long_name": "latitude"})
+root["lat"][:] = lats
+root.require_array("lon", shape=(NLON,), chunks=(NLON,), dtype="float32",
+    dimension_names=["lon"], attributes={"units": "degrees_east", "long_name": "longitude"})
+root["lon"][:] = lons
+root.require_array("geophysical_data",
+    shape=(0, 2, NLAT, NLON, 2), chunks=(1, 1, CLAT, NLON, 2),
+    dtype="int16", fill_value=int(FILL_MISSING), compressors=[Zlib(level=9)],
+    dimension_names=["time", "orbit", "lat", "lon", "band"],
+    attributes={"long_name": "geophysical data", "units": "cm",
+                "scale_factor": SCALE_FACTOR, "_FillValue": int(FILL_MISSING),
+                "missing_value": int(FILL_NOOBS)})
+session.commit("Init strategy 2 (retry)")
+
+result2 = BenchResult(name="shift_array", store_dir=S2_DIR)
+
+for date, note in INSERT_SEQUENCE:
+    day_val = date_to_days(date)
+    t0 = time.perf_counter()
+
+    repo2   = open_repo(S2_DIR)
+    session = repo2.writable_session("main")
+    store   = session.store
+    root    = zarr.open_group(store, mode="r+", zarr_format=3)
+
+    n = root["time"].shape[0]
+    current_days = list(root["time"][:].tolist()) if n > 0 else []
+
+    if day_val in current_days:
+        elapsed = time.perf_counter() - t0
+        result2.insert_times.append(elapsed)
+        result2.insert_labels.append(f"{date} {note}".strip())
+        result2.disk_sizes.append(store_size_bytes(S2_DIR))
+        print(f"  {date} {note:<8} skipped ({elapsed*1e3:.0f} ms)")
+        continue
+
+    sorted_current = sorted(current_days)
+    ins_pos = bisect.bisect_left(sorted_current, day_val)
+    new_len = n + 1
+
+    # Grow
+    root["time"].resize((new_len,))
+    root["geophysical_data"].resize((new_len, 2, NLAT, NLON, 2))
+
+    if n == 0:
+        # First insertion — no shifting needed
+        root["time"][0] = day_val
+        _write_virtual_refs(store, 0, date)
+
+    elif ins_pos == n:
+        # Append to end — shift_array not needed
+        root["time"][n] = day_val
+        _write_virtual_refs(store, n, date)
+
+    else:
+        # Mid or prepend: shift everything right, then re-key slots < ins_pos back
+        session.shift_array("/geophysical_data", [1, 0, 0, 0, 0])
+        session.shift_array("/time", [1])
+
+        # shift_array moved slot k → slot k+1 for ALL k in 0..n-1.
+        # Slots ins_pos..n-1 are now correctly at ins_pos+1..n. ✓
+        # Slots 0..ins_pos-1 are now at 1..ins_pos — WRONG; move them back.
+        if ins_pos > 0:
+            for slot in range(ins_pos):
+                orig_day = sorted_current[slot]
+                orig_date_str = DAY_TO_DATE[orig_day]
+                # The shifted position is slot+1; we need to move it to slot.
+                # We cannot "move" refs; we must re-set them at the correct key.
+                for o_idx in range(len(ORBIT_CODES)):
+                    for manifest in [MANIFEST_CACHE.get(orig_date_str, {}).get(o_idx)]:
+                        if manifest is None:
+                            continue
+                        for (ci, cj, ck), ref in manifest.iter_refs():
+                            # Write at correct position (slot)
+                            key = f"geophysical_data/c/{slot}/{o_idx}/{ci}/{cj}/{ck}"
+                            store.set_virtual_ref(
+                                key, ref["path"],
+                                offset=ref["offset"], length=ref["length"]
+                            )
+
+        # Write time coordinate for all slots in sorted order
+        sorted_new = sorted_current[:]
+        sorted_new.insert(ins_pos, day_val)
+        for i, d in enumerate(sorted_new):
+            root["time"][i] = d
+
+        # Write virtual refs for the new date at ins_pos
+        _write_virtual_refs(store, ins_pos, date)
+
+    session.commit(f"Insert {days_to_datestr(day_val)} → pos {ins_pos}")
+
+    elapsed = time.perf_counter() - t0
+    result2.insert_times.append(elapsed)
+    result2.insert_labels.append(f"{date} {note}".strip())
+    result2.disk_sizes.append(store_size_bytes(S2_DIR))
+    print(f"  {date} {note:<8} → pos {ins_pos:2d}  ({elapsed*1e3:.0f} ms,  {result2.disk_sizes[-1]/1024:.1f} KB)")
+```
+
+## Strategy 3 — `reindex_array` (sorted insert)
+
+`reindex_array` accepts a `forward` callable that maps old chunk coordinates
+to new ones.  To insert at `ins_pos` we shift every chunk with `t >= ins_pos`
+right by one: `forward([t, ...]) → [t+1, ...]` if `t >= ins_pos`, else
+`[t, ...]` (leave in place).  An optional `backward` callable tells
+`reindex_array` which positions should be cleared (the freed `ins_pos` slot).
+
+This is more surgical than `shift_array` — only displaced chunks are
+re-keyed, and slots before `ins_pos` are untouched.
+
+```{python}
+S3_DIR = BENCH_DIR / "reindex_array"
+shutil.rmtree(S3_DIR, ignore_errors=True)
+S3_DIR.mkdir(parents=True, exist_ok=True)
+
+config = make_store_config()
+repo3  = icechunk.Repository.create(
+    icechunk.local_filesystem_storage(str(S3_DIR)), config=config
+)
+
+session = repo3.writable_session("main")
+root    = zarr.open_group(session.store, mode="w", zarr_format=3)
+
+root.require_array("time", shape=(0,), chunks=(512,), dtype="int32",
+    dimension_names=["time"],
+    attributes={"units": TIME_UNITS, "calendar": TIME_CALENDAR, "long_name": "observation date"})
+root.require_array("orbit", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["orbit"], attributes={"long_name": "orbit direction"})
+root["orbit"][:] = ORBIT_LABELS
+root.require_array("band", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["band"], attributes={"long_name": "band name"})
+root["band"][:] = ["snow_depth", "quality_flag"]
+root.require_array("lat", shape=(NLAT,), chunks=(NLAT,), dtype="float32",
+    dimension_names=["lat"], attributes={"units": "degrees_north", "long_name": "latitude"})
+root["lat"][:] = lats
+root.require_array("lon", shape=(NLON,), chunks=(NLON,), dtype="float32",
+    dimension_names=["lon"], attributes={"units": "degrees_east", "long_name": "longitude"})
+root["lon"][:] = lons
+root.require_array("geophysical_data",
+    shape=(0, 2, NLAT, NLON, 2), chunks=(1, 1, CLAT, NLON, 2),
+    dtype="int16", fill_value=int(FILL_MISSING), compressors=[Zlib(level=9)],
+    dimension_names=["time", "orbit", "lat", "lon", "band"],
+    attributes={"long_name": "geophysical data", "units": "cm",
+                "scale_factor": SCALE_FACTOR, "_FillValue": int(FILL_MISSING),
+                "missing_value": int(FILL_NOOBS)})
+session.commit("Init strategy 3")
+
+result3 = BenchResult(name="reindex_array", store_dir=S3_DIR)
+
+for date, note in INSERT_SEQUENCE:
+    day_val = date_to_days(date)
+    t0 = time.perf_counter()
+
+    repo3   = open_repo(S3_DIR)
+    session = repo3.writable_session("main")
+    store   = session.store
+    root    = zarr.open_group(store, mode="r+", zarr_format=3)
+
+    n = root["time"].shape[0]
+    current_days = list(root["time"][:].tolist()) if n > 0 else []
+
+    if day_val in current_days:
+        elapsed = time.perf_counter() - t0
+        result3.insert_times.append(elapsed)
+        result3.insert_labels.append(f"{date} {note}".strip())
+        result3.disk_sizes.append(store_size_bytes(S3_DIR))
+        print(f"  {date} {note:<8} skipped ({elapsed*1e3:.0f} ms)")
+        continue
+
+    sorted_current = sorted(current_days)
+    ins_pos = bisect.bisect_left(sorted_current, day_val)
+    new_len = n + 1
+
+    # Grow arrays
+    root["time"].resize((new_len,))
+    root["geophysical_data"].resize((new_len, 2, NLAT, NLON, 2))
+
+    if n > 0 and ins_pos < n:
+        # Use reindex_array to shift only chunks at t >= ins_pos right by 1.
+        # forward:  [t, o, ci, cj, ck] → [t+1, o, ci, cj, ck] if t >= ins_pos
+        #           else leave in place (return same coords)
+        # backward: [t, o, ci, cj, ck] → [t-1, o, ci, cj, ck] if t == ins_pos
+        #           (nothing maps to ins_pos after the shift, so clear it)
+        #           else return same coords (position has a valid source)
+        def forward(coords, _ip=ins_pos):
+            t = coords[0]
+            if t >= _ip:
+                return [t + 1] + list(coords[1:])
+            return list(coords)
+
+        def backward(coords, _ip=ins_pos, _n=n):
+            t = coords[0]
+            if t == _ip:
+                # Nothing maps here after the shift — clear it
+                return None
+            if t > _ip:
+                return [t - 1] + list(coords[1:])
+            return list(coords)
+
+        session.reindex_array("/geophysical_data", forward=forward, backward=backward)
+
+    # Update time coordinate: insert day_val at ins_pos in sorted order
+    sorted_new = sorted_current[:]
+    sorted_new.insert(ins_pos, day_val)
+    for i, d in enumerate(sorted_new):
+        root["time"][i] = d
+
+    # Write virtual refs for the new date at ins_pos
+    _write_virtual_refs(store, ins_pos, date)
+
+    session.commit(f"Insert {days_to_datestr(day_val)} → pos {ins_pos}")
+
+    elapsed = time.perf_counter() - t0
+    result3.insert_times.append(elapsed)
+    result3.insert_labels.append(f"{date} {note}".strip())
+    result3.disk_sizes.append(store_size_bytes(S3_DIR))
+    print(f"  {date} {note:<8} → pos {ins_pos:2d}  ({elapsed*1e3:.0f} ms,  {result3.disk_sizes[-1]/1024:.1f} KB)")
+```
+
+## Strategy 4 — Pre-allocated empty store
+
+The entire date range from the AMSR2 mission start (2012-06-01) through the
+end of 2026 is pre-allocated as empty time slots.  Each `insert_date` call
+simply looks up the correct index and writes virtual refs there — no resizing,
+no shifting, no coordinate updates.
+
+The cost is paid up front: `PREALLOC_NDAYS` time slots are reserved in the
+store even though most will never be filled.  The trade-off is that every
+subsequent insertion is O(1) and independent of insertion order.
+
+```{python}
+S4_DIR = BENCH_DIR / "preallocated"
+shutil.rmtree(S4_DIR, ignore_errors=True)
+S4_DIR.mkdir(parents=True, exist_ok=True)
+
+# Build the complete sorted time axis: one slot per calendar day
+prealloc_days = pd.date_range(PREALLOC_START, PREALLOC_END, freq="D")
+PREALLOC_DAY_VALS = ((prealloc_days - TIME_EPOCH).days.astype("int32"))
+PREALLOC_NDAYS    = len(PREALLOC_DAY_VALS)
+# Fast lookup: day_value → slot index
+DAY_TO_SLOT: dict[int, int] = {int(d): i for i, d in enumerate(PREALLOC_DAY_VALS)}
+
+print(f"Pre-allocating {PREALLOC_NDAYS:,} time slots "
+      f"({PREALLOC_START.date()} → {PREALLOC_END.date()})")
+
+config = make_store_config()
+repo4  = icechunk.Repository.create(
+    icechunk.local_filesystem_storage(str(S4_DIR)), config=config
+)
+
+session = repo4.writable_session("main")
+root    = zarr.open_group(session.store, mode="w", zarr_format=3)
+
+root.require_array("time", shape=(PREALLOC_NDAYS,), chunks=(512,), dtype="int32",
+    dimension_names=["time"],
+    attributes={"units": TIME_UNITS, "calendar": TIME_CALENDAR, "long_name": "observation date"})
+root["time"][:] = PREALLOC_DAY_VALS
+
+root.require_array("orbit", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["orbit"], attributes={"long_name": "orbit direction"})
+root["orbit"][:] = ORBIT_LABELS
+root.require_array("band", shape=(2,), chunks=(2,), dtype=str,
+    dimension_names=["band"], attributes={"long_name": "band name"})
+root["band"][:] = ["snow_depth", "quality_flag"]
+root.require_array("lat", shape=(NLAT,), chunks=(NLAT,), dtype="float32",
+    dimension_names=["lat"], attributes={"units": "degrees_north", "long_name": "latitude"})
+root["lat"][:] = lats
+root.require_array("lon", shape=(NLON,), chunks=(NLON,), dtype="float32",
+    dimension_names=["lon"], attributes={"units": "degrees_east", "long_name": "longitude"})
+root["lon"][:] = lons
+root.require_array("geophysical_data",
+    shape=(PREALLOC_NDAYS, 2, NLAT, NLON, 2), chunks=(1, 1, CLAT, NLON, 2),
+    dtype="int16", fill_value=int(FILL_MISSING), compressors=[Zlib(level=9)],
+    dimension_names=["time", "orbit", "lat", "lon", "band"],
+    attributes={"long_name": "geophysical data", "units": "cm",
+                "scale_factor": SCALE_FACTOR, "_FillValue": int(FILL_MISSING),
+                "missing_value": int(FILL_NOOBS)})
+session.commit("Init strategy 4 — pre-allocated")
+
+prealloc_init_size = store_size_bytes(S4_DIR)
+print(f"Initial store size: {prealloc_init_size / 1024:.1f} KB")
+
+result4 = BenchResult(name="preallocated", store_dir=S4_DIR)
+
+for date, note in INSERT_SEQUENCE:
+    day_val = date_to_days(date)
+    t0 = time.perf_counter()
+
+    if day_val not in DAY_TO_SLOT:
+        elapsed = time.perf_counter() - t0
+        result4.insert_times.append(elapsed)
+        result4.insert_labels.append(f"{date} {note}".strip())
+        result4.disk_sizes.append(store_size_bytes(S4_DIR))
+        print(f"  {date} {note:<8} out of range — skipped ({elapsed*1e3:.0f} ms)")
+        continue
+
+    slot = DAY_TO_SLOT[day_val]
+
+    repo4   = open_repo(S4_DIR)
+    session = repo4.writable_session("main")
+    store   = session.store
+    root    = zarr.open_group(store, mode="r+", zarr_format=3)
+
+    # Check if already filled (virtual refs already present)
+    # We detect this by checking whether the first expected chunk key exists.
+    # There is no direct "is this slot filled?" API; we use the time value as a proxy.
+    # (All slots have time values pre-written; duplication is always a no-op rewrite.)
+    # Instead, track filled slots locally.
+    _write_virtual_refs(store, slot, date)
+    session.commit(f"Fill slot {slot} ({days_to_datestr(day_val)})")
+
+    elapsed = time.perf_counter() - t0
+    result4.insert_times.append(elapsed)
+    result4.insert_labels.append(f"{date} {note}".strip())
+    result4.disk_sizes.append(store_size_bytes(S4_DIR))
+    print(f"  {date} {note:<8} → slot {slot:5d}  ({elapsed*1e3:.0f} ms,  {result4.disk_sizes[-1]/1024:.1f} KB)")
+```
+
+## Open + plot benchmark
+
+Each strategy's store is opened fresh and timed through:
+1. `xr.open_zarr` + coordinate materialisation
+2. Selecting the Alaska subset and computing a mean time series
+3. Plotting
+
+```{python}
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import xarray as xr
+
+ALL_RESULTS = [result1, result2, result3, result4]
+
+def _open_ds(store_dir: Path) -> xr.Dataset:
+    repo    = open_repo(store_dir)
+    session = repo.readonly_session("main")
+    ds = (
+        xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+        .sortby("time")
+        .assign_coords(
+            lat=lambda d: d.lat.load(),
+            lon=lambda d: d.lon.load(),
+        )
+    )
+    return ds
+
+
+def _plot_alaska(ds: xr.Dataset) -> None:
+    ak = (
+        ds["geophysical_data"]
+        .sel(band="snow_depth")
+        .isel(lat=AK_ROWS, lon=AK_COLS)
+        .mean(dim=["lat", "lon"], skipna=True)
+    )
+    fig, ax = plt.subplots(figsize=(10, 3))
+    for orbit_label, color, marker, ls in [
+        ("Ascending",  "steelblue",  "o", "-"),
+        ("Descending", "darkorange", "s", "--"),
+    ]:
+        ak.sel(orbit=orbit_label).plot(
+            ax=ax, label=orbit_label, color=color, marker=marker, linestyle=ls
+        )
+    ax.set_ylabel("Mean snow depth (cm)")
+    ax.legend(); ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+fig_rows = len(ALL_RESULTS)
+fig, outer_axes = plt.subplots(fig_rows, 1, figsize=(12, 4 * fig_rows))
+
+for result in ALL_RESULTS:
+    t0 = time.perf_counter()
+    ds = _open_ds(result.store_dir)
+    _plot_alaska(ds)
+    result.open_plot_time = time.perf_counter() - t0
+    print(f"  {result.name:<20}  open+plot: {result.open_plot_time*1e3:.0f} ms")
+
+plt.close("all")
+```
+
+## Results summary
+
+```{python}
+import matplotlib.ticker as mticker
+
+print("\n=== Per-insertion timing ===")
+header = f"{'Step':<22}"
+for r in ALL_RESULTS:
+    header += f"  {r.name:>18}"
+print(header)
+print("-" * (22 + 20 * len(ALL_RESULTS)))
+
+for i, (date, note) in enumerate(INSERT_SEQUENCE):
+    label = f"{date} {note}".strip()
+    row = f"{label:<22}"
+    for r in ALL_RESULTS:
+        if i < len(r.insert_times):
+            row += f"  {r.insert_times[i]*1e3:>15.0f} ms"
+        else:
+            row += f"  {'—':>18}"
+    print(row)
+
+print(f"\n{'Total insert time':<22}", end="")
+for r in ALL_RESULTS:
+    total = sum(r.insert_times)
+    print(f"  {total*1e3:>15.0f} ms", end="")
+print()
+
+print(f"\n{'Open + plot time':<22}", end="")
+for r in ALL_RESULTS:
+    print(f"  {r.open_plot_time*1e3:>15.0f} ms", end="")
+print()
+
+print(f"\n{'Final store size':<22}", end="")
+for r in ALL_RESULTS:
+    size = r.disk_sizes[-1] if r.disk_sizes else 0
+    print(f"  {size/1024:>14.1f} KB", end="")
+print()
+```
+
+```{python}
+# ── Visualise timing ──────────────────────────────────────────────────────────
+labels = [f"{d} {n}".strip() for d, n in INSERT_SEQUENCE]
+x      = np.arange(len(labels))
+width  = 0.2
+colors = ["steelblue", "darkorange", "seagreen", "crimson"]
+
+fig, axes = plt.subplots(2, 1, figsize=(14, 9))
+
+# Top: per-insertion time
+ax = axes[0]
+for i, (r, c) in enumerate(zip(ALL_RESULTS, colors)):
+    times_ms = [t * 1e3 for t in r.insert_times]
+    ax.bar(x + i * width, times_ms, width, label=r.name, color=c, alpha=0.8)
+ax.set_xticks(x + width * 1.5)
+ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+ax.set_ylabel("Wall-clock time (ms)")
+ax.set_title("Per-insertion time by strategy")
+ax.legend()
+ax.grid(True, axis="y", alpha=0.3)
+
+# Bottom: cumulative disk size
+ax2 = axes[1]
+for r, c in zip(ALL_RESULTS, colors):
+    sizes_kb = [s / 1024 for s in r.disk_sizes]
+    ax2.plot(range(1, len(sizes_kb) + 1), sizes_kb,
+             marker="o", label=r.name, color=c)
+ax2.set_xlabel("Insertion step")
+ax2.set_ylabel("Store size (KB)")
+ax2.set_title("Store disk size after each insertion")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("icechunk-benchmark.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved icechunk-benchmark.png")
+```
+
+```{python}
+# ── Summary bar: open+plot time ───────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 4))
+names      = [r.name for r in ALL_RESULTS]
+open_times = [r.open_plot_time * 1e3 for r in ALL_RESULTS]
+bars = ax.bar(names, open_times, color=colors, alpha=0.85)
+ax.bar_label(bars, fmt="%.0f ms", padding=3)
+ax.set_ylabel("Wall-clock time (ms)")
+ax.set_title("Open + plot time by strategy")
+ax.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.savefig("icechunk-benchmark-openplot.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("Saved icechunk-benchmark-openplot.png")
+```

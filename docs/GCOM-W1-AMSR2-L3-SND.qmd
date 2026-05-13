@@ -231,8 +231,7 @@ def _open_h5_fileobj(path: str | Path, access_options: dict | None = None):
         base_url = f"{parts.scheme}://{parts.netloc}"
         obj_path = parts.path.lstrip("/")
         store = HTTPStore.from_url(base_url, **opts)
-        data = obstore.get(store, obj_path).bytes()
-        buf = io.BytesIO(bytes(data))
+        buf = io.BytesIO(obstore.get(store, obj_path).bytes())
         # Return a context manager wrapper so callers can use "with" syntax
         class _CM:
             def __enter__(self_):  return buf
