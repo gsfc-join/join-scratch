@@ -4,6 +4,7 @@ docs/.quarto/
 docs/*_files/
 docs/*.html
 docs/*-jupyter-*
+docs/*.png
 
 # Terraform outputs
 _aws-sandbox/_tfout.json
