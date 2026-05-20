@@ -50,6 +50,25 @@ python3 workflows/swe/visualize_combined.py \
           --output-dir s3://airborne-smce-prod-user-bucket/JOIN/results/figures/swe
 """
 
+amsr2_regrid = """
+python3 workflows/swe/amsr2_regrid.py \
+          --lis-path s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc \
+          --store-uri s3://airborne-smce-prod-user-bucket/JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND \
+          --weights-uri s3://airborne-smce-prod-user-bucket/JOIN/cached-weights/GCOM-W1-AMSR2-L3-SND/lis-1km-missouri.nc4 \
+          --output-path s3://airborne-smce-prod-user-bucket/JOIN/outputs/GCOM-W1-AMSR2-L3-SND-20230115-20230115.nc \
+          --start-date 20230115 \
+          --end-date 20230115
+"""
+
+amsr2_visualize = """
+python3 workflows/swe/amsr2_visualize.py \
+          --lis-path s3://airborne-smce-prod-user-bucket/JOIN/lis_input_NMP_1000m_missouri.nc \
+          --regridded-path s3://airborne-smce-prod-user-bucket/JOIN/outputs/GCOM-W1-AMSR2-L3-SND-20230115-20230115.nc \
+          --store-uri s3://airborne-smce-prod-user-bucket/JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND \
+          --polygons-path workflows/swe/zoom_polygons.geojson \
+          --output-dir _figures/amsr2
+"""
+
 
 [tool.pixi.dependencies]
 python = ">=3.14.4,<3.15"
