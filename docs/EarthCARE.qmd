@@ -1,0 +1,470 @@
+---
+title: "EarthCARE — Cloud Profiling and Geolocation Products"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Overview
+
+**EarthCARE** (Earth Cloud, Aerosol and Radiation Explorer) is a joint ESA/JAXA
+satellite mission launched in May 2024.  It carries four co-aligned instruments
+— a Cloud Profiling Radar (CPR), an Atmospheric LiDAR (ATLID), a Multi-Spectral
+Imager (MSI), and a Broad-Band Radiometer (BBR) — designed to characterise
+clouds, aerosols, and their radiative effects.
+
+The S3 bucket at `s3://airborne-smce-prod-user-bucket/JOIN/EarthCARE/` holds two
+product types:
+
+| Attribute | Value |
+|---|---|
+| Satellite | EarthCARE |
+| Agency | ESA / JAXA |
+| Orbit type | Sun-synchronous, ~97 min period |
+| Swath type | Nadir-pointing curtain (along-track) |
+| Data format | HDF5 (`.h5`) |
+| S3 bucket | `s3://airborne-smce-prod-user-bucket/JOIN/EarthCARE/` |
+| Products available | `AC__CLP` (cloud profiling), `AUX_MET` (geolocation/met grid) |
+| Date range in bucket | 2026-01-24 – 2026-02-18 |
+| Total granules (each product) | 142 |
+
+---
+
+## S3 bucket organisation
+
+Files are arranged under two product prefixes, each following a
+`{PRODUCT}/{YYYY}/{MM}/{DD}/` hierarchy:
+
+```
+s3://airborne-smce-prod-user-bucket/JOIN/EarthCARE/
+  AC__CLP/
+    2026/
+      01/
+        24/   ← 6 granules
+        25/   ← 5 granules
+        …
+      02/
+        18/   ← last available day
+  AUX_MET/
+    2026/
+      01/
+        24/   ← 6 granules (same orbit segments as AC__CLP)
+        …
+      02/
+        18/
+```
+
+Each day typically contains 5–6 granule files per product, corresponding to
+the orbit segments that pass over the region during that UTC day.  Both product
+types are co-timed: each `AC__CLP` granule has a matching `AUX_MET` granule for
+the same orbit segment and time window (identified by the shared orbit number
+and sensing-time stamp in the filename).
+
+### `AC__CLP` — L2B Combined Cloud Profiling
+
+Product code `AC__CLP_2BS`.  Combines CPR and ATLID retrievals to produce
+vertical profiles of cloud and precipitation properties at 1 km and 10 km
+along-track resolution.  File size ~28–36 MB per granule.
+
+### `AUX_MET` — Auxiliary Meteorological / Geolocation Grid
+
+Product code `AUX_MET` (file type `AUX_JSG_1DS`).  Provides the co-located
+geolocation grid (latitude, longitude, altitude) and meteorological context
+fields (temperature, humidity, pressure) resampled onto the EarthCARE
+along-track × across-track standard grid.  File size ~33 MB per granule.
+
+---
+
+## File naming convention
+
+Both product types follow the same ESA Earth Explorer filename template:
+
+```
+ECA_{sensor}_{product_type}_{sensing_start}_{sensing_stop}_{orbit_id}{direction}_{version}.h5
+```
+
+### `AC__CLP` example
+
+```
+ECA_J_AC__CLP_2BS_20260124T0354_20260124T0406_09417B_vCa.h5
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `ECA` | — | EarthCARE mission prefix |
+| `J` | `J` | Joint instrument product (CPR + ATLID) |
+| `AC__CLP_2BS` | — | Product type: combined cloud profiling, L2B swath |
+| `20260124T0354` | — | Sensing start: 2026-01-24 03:54 UTC |
+| `20260124T0406` | — | Sensing stop: 2026-01-24 04:06 UTC |
+| `09417` | — | Absolute orbit number |
+| `B` | `B` / `D` | Orbit direction: `B` = ascending, `D` = descending |
+| `vCa` | — | Product version |
+
+### `AUX_MET` example
+
+```
+ECA_E_AUX_JSG_1DS_20260124T0354_20260124T0406_09417B_vBc.h5
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `E` | `E` | Spacecraft-level product (ECMWF-collocated) |
+| `AUX_JSG_1DS` | — | Auxiliary Joint Standard Grid, 1D swath |
+| remaining fields | — | Same convention as `AC__CLP` above |
+
+---
+
+## File contents
+
+Both products use the same top-level HDF5 structure:
+
+```
+/
+├── HeaderData/
+│   ├── FixedProductHeader/     ← mission, file type, version strings
+│   └── VariableProductHeader/
+│       ├── MainProductHeader/  ← orbit metadata (orbit number, sensing times,
+│       │                          frame lat/lon, state vectors)
+│       └── SpecificProductHeader/
+└── ScienceData/                ← geophysical and geolocation arrays
+```
+
+### `AC__CLP` — `ScienceData` contents
+
+#### `ScienceData/Geo/` — geolocation
+
+| Dataset | Shape | dtype | Description |
+|---|---|---|---|
+| `latitude` | `(nalong,)` | float64 | Footprint latitude (degrees) |
+| `longitude` | `(nalong,)` | float64 | Footprint longitude (degrees) |
+| `height` | `(nalong, nheight)` | float32 | Altitude of each range bin (m) |
+| `surface_elevation` | `(nalong,)` | float32 | Surface elevation (m) |
+| `time` | `(nalong,)` | float64 | Seconds since 2000-01-01 00:00:00 UTC |
+| `Scan_Time/*` | `(nalong,)` | int/float | Year, Month, Day, Hour, Minute, Second, MilliSecond |
+| `day_night_flag` | `(nalong,)` | int8 | 0 = day, 1 = night |
+| `land_water_flag` | `(nalong,)` | int8 | Surface type flag |
+
+A typical granule spans ~4 945 along-track footprints × 206 range-height bins
+(1 km resolution).
+
+#### `ScienceData/Data/` — cloud/precipitation retrievals
+
+Variables come in pairs at two resolutions: `_1km` (full resolution,
+~4 945 × 206) and `_10km` (averaged, same along-track count × 206 bins).
+Selected key variables:
+
+| Dataset | Units | Description |
+|---|---|---|
+| `cloud_radar_reflectivity_1km` | dBZ | Attenuated radar reflectivity factor |
+| `cloud_extinction_1km` | /m | Cloud extinction coefficient |
+| `cloud_backscatter_1km` | /m/sr | Cloud backscatter coefficient |
+| `cloud_doppler_velocity_1km` | m/s | Cloud Doppler velocity |
+| `attenuated_backscatter_1km` | /m/sr | Total attenuated backscatter |
+| `cloud_water_content_1km` | kg/m³ | Cloud liquid water content |
+| `cloud_ice_content_1km` | kg/m³ | Cloud ice water content |
+| `cloud_effective_radius1_1km` | μm | Cloud effective particle radius |
+| `cloud_particle_category_cpr_atlid_1km` | — | Particle category flag |
+| `cloud_mask_cpr_atlid_1km` | — | Combined CPR/ATLID cloud mask |
+| `quality_flag_1km` | — | Per-bin quality flags `(nalong, nbins, 10)` |
+| `optical_thickness_1km` | — | Column cloud optical thickness `(nalong,)` |
+| `cloud_water_path_1km` | kg/m² | Column cloud water path `(nalong,)` |
+
+Fill value: `9.969209968386869e+36` (IEEE 754 special value).
+
+### `AUX_MET` — `ScienceData` contents
+
+| Dataset | Shape | dtype | Description |
+|---|---|---|
+| `latitude` | `(nalong, nacross)` | float64 | 2D grid latitude |
+| `longitude` | `(nalong, nacross)` | float64 | 2D grid longitude |
+| `altitude` | `(nalong, nheight)` | float32 | Altitude levels (m) |
+| `height` | `(nheight,)` | float32 | Standard height levels |
+| `surface_elevation` | `(nalong, nacross)` | float32 | Surface elevation (m) |
+| `time` | `(nalong,)` | float64 | Along-track time |
+| `land_flag` | `(nalong, nacross)` | int8 | Land/water mask |
+| `sensor_altitude` | `(nalong,)` | float32 | Spacecraft altitude |
+| `sensor_azimuth_angle` | `(nalong, nacross)` | float32 | Viewing azimuth |
+| `sensor_elevation_angle` | `(nalong, nacross)` | float32 | Viewing elevation |
+| `solar_azimuth_angle` | `(nalong, nacross)` | float32 | Solar azimuth |
+| `solar_elevation_angle` | `(nalong, nacross)` | float32 | Solar elevation |
+
+A typical `AUX_MET` granule has dimensions ~5 145 along-track × 207 across-track
+× 242 height levels.
+
+---
+
+## Creating a VirtualZarr IceChunk store
+
+The following demonstrates building an IceChunk store that holds virtual
+references to three consecutive `AC__CLP` granules directly from their S3 URLs.
+No data is downloaded; only chunk byte-range metadata is written to the store.
+
+The store merges variables from both `ScienceData/Geo` (geolocation) and
+`ScienceData/Data` (retrievals) into a single dataset.  The along-track
+dimension is given the name `nalong` and a decoded `datetime64` coordinate
+(`time`) is attached so that `.sel(time=...)` works.  The height-bin dimension
+is named `nheight` and left as an integer index.
+
+### Setup
+
+```{python}
+import os
+os.environ.setdefault("RUST_LOG", "error")
+
+import io
+import h5py
+import icechunk
+import numpy as np
+import xarray as xr
+import obstore
+from obstore.store import S3Store
+from obspec_utils.registry import ObjectStoreRegistry
+from virtualizarr.parsers import HDFParser
+from virtualizarr.writers.icechunk import virtual_dataset_to_icechunk
+import shutil
+from pathlib import Path
+```
+
+```{python}
+S3_BUCKET = "airborne-smce-prod-user-bucket"
+S3_PREFIX = "JOIN/EarthCARE/AC__CLP"
+S3_REGION = "us-west-2"
+
+# Three consecutive granules from 2026-01-24 (orbit 09417–09419, ascending)
+GRANULES = [
+    f"s3://{S3_BUCKET}/{S3_PREFIX}/2026/01/24/ECA_J_AC__CLP_2BS_20260124T0354_20260124T0406_09417B_vCa.h5",
+    f"s3://{S3_BUCKET}/{S3_PREFIX}/2026/01/24/ECA_J_AC__CLP_2BS_20260124T0526_20260124T0538_09418B_vCa.h5",
+    f"s3://{S3_BUCKET}/{S3_PREFIX}/2026/01/24/ECA_J_AC__CLP_2BS_20260124T0659_20260124T0711_09419B_vCa.h5",
+]
+
+STORE_DIR = Path("../_data/earthcare/icechunk-stores/ac_clp_demo").resolve()
+
+# EarthCARE time epoch (TAI seconds since 2000-01-01 00:00:00 UTC)
+EC_EPOCH = np.datetime64("2000-01-01T00:00:00", "ns")
+```
+
+### Helper: read coordinates from a granule
+
+Coordinates (time, latitude, longitude) are small 1-D arrays (~5 000 values).
+We read them eagerly — one `obstore.get` call per granule — and use them as
+loadable dimension coordinates in the final dataset.
+
+```{python}
+s3_store = S3Store.from_url(f"s3://{S3_BUCKET}/", region=S3_REGION)
+registry = ObjectStoreRegistry({f"s3://{S3_BUCKET}/": s3_store})
+
+
+def read_ec_coords(url: str) -> dict:
+    """Read time, latitude, longitude arrays from an AC__CLP granule."""
+    key = url.removeprefix(f"s3://{S3_BUCKET}/")
+    buf = io.BytesIO(obstore.get(s3_store, key).bytes())
+    with h5py.File(buf, "r") as f:
+        time_sec = f["ScienceData/Geo/time"][:]   # float64, seconds since EC_EPOCH
+        lat      = f["ScienceData/Geo/latitude"][:]
+        lon      = f["ScienceData/Geo/longitude"][:]
+    time_ns = (time_sec * 1e9).astype("int64")
+    time_dt = EC_EPOCH + time_ns.astype("timedelta64[ns]")
+    return {"time": time_dt, "latitude": lat, "longitude": lon}
+```
+
+### Open virtual datasets and attach coordinates
+
+We open two virtual datasets per granule (`ScienceData/Geo` and
+`ScienceData/Data`), rename the generic `phony_dim_*` axes to `nalong` and
+`nheight`, merge them into one dataset, then attach the loadable coordinate
+arrays.
+
+```{python}
+geo_parser  = HDFParser(group="ScienceData/Geo")
+data_parser = HDFParser(group="ScienceData/Data")
+
+# EarthCARE uses -9999 as a secondary missing-data sentinel (meaning "no
+# retrieval / no cloud detected") in addition to the declared _FillValue of
+# 9.96921e+36.  Adding missing_value=-9999 to each float variable's attrs
+# ensures xarray's mask_and_scale=True masks both sentinels.
+EC_MISSING = -9999.0
+
+def add_missing_value(vds):
+    """Add missing_value attr to all float variables that lack it."""
+    new_vars = {}
+    for name, var in vds.data_vars.items():
+        if var.dtype.kind == "f" and "missing_value" not in var.attrs:
+            new_attrs = dict(var.attrs) | {"missing_value": EC_MISSING}
+            new_vars[name] = var.assign_attrs(new_attrs)
+    return vds.assign(new_vars)
+
+
+vds_list = []
+for url in GRANULES:
+    # --- virtual datasets (no data downloaded) ---
+    vds_geo  = geo_parser(url,  registry=registry).to_virtual_dataset()
+    vds_data = data_parser(url, registry=registry).to_virtual_dataset()
+
+    # Rename phony dims to meaningful names.
+    vds_geo  = vds_geo.rename({"phony_dim_0": "nalong", "phony_dim_1": "nheight"})
+    vds_data = vds_data.rename({"phony_dim_0": "nalong", "phony_dim_1": "nheight",
+                                 "phony_dim_2": "nqflag"})
+
+    # Merge both groups into one dataset and annotate missing values
+    vds = add_missing_value(xr.merge([vds_geo, vds_data]))
+
+    # --- loadable coordinates (small, downloaded now) ---
+    coords = read_ec_coords(url)
+    vds = vds.assign_coords(
+        time      =("nalong", coords["time"],
+                    {"long_name": "observation time", "timezone": "UTC"}),
+        latitude  =("nalong", coords["latitude"],
+                    {"long_name": "latitude",  "units": "degrees_north"}),
+        longitude =("nalong", coords["longitude"],
+                    {"long_name": "longitude", "units": "degrees_east"}),
+    ).set_index(nalong="time")
+
+    vds_list.append(vds)
+    print(f"  {url.split('/')[-1]}: nalong={vds.sizes['nalong']}, nheight={vds.sizes['nheight']}")
+```
+
+### Write to an IceChunk store (append per granule)
+
+VirtualiZarr's `virtual_dataset_to_icechunk` accepts an `append_dim` argument
+that resizes the store and appends new virtual chunk references — no data is
+moved.  We write the first granule normally, then append the remaining two
+along `nalong`.
+
+```{python}
+shutil.rmtree(STORE_DIR, ignore_errors=True)
+STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+config = icechunk.RepositoryConfig.default()
+config.set_virtual_chunk_container(
+    icechunk.VirtualChunkContainer(
+        f"s3://{S3_BUCKET}/", icechunk.s3_store(region=S3_REGION)
+    )
+)
+repo = icechunk.Repository.create(
+    icechunk.local_filesystem_storage(str(STORE_DIR)), config=config
+)
+
+for i, (url, vds) in enumerate(zip(GRANULES, vds_list)):
+    session = repo.writable_session("main")
+    if i == 0:
+        virtual_dataset_to_icechunk(vds, session.store)
+    else:
+        virtual_dataset_to_icechunk(vds, session.store, append_dim="nalong")
+    session.commit(f"Append granule {i}: {url.split('/')[-1]}")
+    print(f"  committed granule {i}")
+
+print(f"Store written to {STORE_DIR}")
+```
+
+### Re-open and inspect
+
+```{python}
+repo2    = icechunk.Repository.open(
+    icechunk.local_filesystem_storage(str(STORE_DIR)),
+    authorize_virtual_chunk_access={f"s3://{S3_BUCKET}/": None},
+)
+ds = xr.open_zarr(
+    repo2.readonly_session("main").store,
+    consolidated=False,
+    mask_and_scale=True,   # masks both _FillValue (9.96921e+36) and missing_value (-9999)
+)
+print(ds)
+```
+
+The `nalong` dimension is indexed by `datetime64` time values, enabling
+time-based selection with `.sel()`:
+
+```{python}
+# Select a 10-minute window by time
+window = ds.sel(nalong=slice("2026-01-24T04:00", "2026-01-24T04:10"))
+print(f"Footprints in window: {window.sizes['nalong']}")
+print(window[["latitude", "longitude", "cloud_radar_reflectivity_1km"]])
+```
+
+---
+
+## Visualizations
+
+### Vertical curtain: radar reflectivity
+
+The radar reflectivity curtain shows the vertical structure of clouds along
+the satellite track.  We load a short segment from the middle of the combined
+three-granule swath.
+
+```{python}
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+FILL = 9.969209968386869e+36
+
+# 30-minute segment from orbit 09418
+seg = ds.sel(nalong=slice("2026-01-24T05:26", "2026-01-24T05:56"))
+refl = seg["cloud_radar_reflectivity_1km"].values          # (nalong, nheight)
+lat  = seg["latitude"].values
+
+# Fill values are already NaN (mask_and_scale=True); clip any residuals
+refl = np.where(np.isfinite(refl), refl, np.nan)
+
+# Height axis: EarthCARE bins run top-down (bin 0 ≈ 20 km, bin 205 ≈ −0.5 km).
+# Passing height values in descending order means pcolormesh naturally places
+# high altitude at the top — no invert_yaxis needed.
+nheight = refl.shape[1]
+height_km = np.linspace(20, -0.5, nheight)   # approximate; exact in ScienceData/Geo/height
+
+fig, ax = plt.subplots(figsize=(14, 4))
+pcm = ax.pcolormesh(
+    lat, height_km, refl.T,
+    cmap="RdYlBu_r", vmin=-30, vmax=20, shading="auto"
+)
+plt.colorbar(pcm, ax=ax, label="Radar reflectivity (dBZ)", pad=0.01)
+ax.set_xlabel("Latitude (°N)")
+ax.set_ylabel("Altitude (km)")
+ax.set_title("EarthCARE AC__CLP — Attenuated Radar Reflectivity (1 km)\n"
+             "Orbit 09418 · 2026-01-24 · ascending pass")
+plt.tight_layout()
+plt.show()
+```
+
+### Vertical curtain: cloud extinction (ATLID)
+
+```{python}
+ext = seg["cloud_extinction_1km"].values
+ext = np.where(np.isfinite(ext), ext, np.nan)
+# Clip extreme values for display
+ext_clipped = np.clip(ext, 0, 0.05)
+
+fig, ax = plt.subplots(figsize=(14, 4))
+pcm = ax.pcolormesh(
+    lat, height_km, ext_clipped.T,
+    cmap="plasma", vmin=0, vmax=0.03, shading="auto"
+)
+plt.colorbar(pcm, ax=ax, label="Cloud extinction (/m)", pad=0.01)
+ax.set_xlabel("Latitude (°N)")
+ax.set_ylabel("Altitude (km)")
+ax.set_title("EarthCARE AC__CLP — Cloud Extinction Coefficient (1 km)\n"
+             "Orbit 09418 · 2026-01-24 · ascending pass")
+plt.tight_layout()
+plt.show()
+```
+
+### Column-integrated cloud optical thickness
+
+```{python}
+ot  = seg["optical_thickness_1km"].values
+ot  = np.where(np.isfinite(ot), ot, np.nan)
+
+fig, ax = plt.subplots(figsize=(12, 3))
+ax.plot(lat, ot, color="steelblue", lw=0.8)
+ax.set_xlabel("Latitude (°N)")
+ax.set_ylabel("Optical thickness")
+ax.set_title("EarthCARE AC__CLP — Column Cloud Optical Thickness\n"
+             "Orbit 09418 · 2026-01-24")
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```

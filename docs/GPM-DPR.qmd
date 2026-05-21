@@ -1,0 +1,514 @@
+---
+title: "GPM DPR — Dual-Frequency Precipitation Radar (2A-DPR V07C)"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Overview
+
+The **GPM DPR** (Dual-Frequency Precipitation Radar) product `2A-DPR` is the
+Level-2 standard precipitation retrieval from the Dual-Frequency Precipitation
+Radar aboard the **Global Precipitation Measurement (GPM)** Core Observatory,
+a joint NASA/JAXA mission.  The DPR comprises two radars: Ku-band (13.6 GHz,
+Full Scan) and Ka-band (35.5 GHz, High-Sensitivity scan), enabling
+dual-frequency retrievals of precipitation rate, drop-size distribution, and
+vertical structure.
+
+The S3 bucket at `s3://airborne-smce-prod-user-bucket/JOIN/GPM-DPR/` holds
+V07C granule files for early 2026.
+
+| Attribute | Value |
+|---|---|
+| Satellite | GPM Core Observatory |
+| Agency | NASA / JAXA |
+| Instrument | Dual-Frequency Precipitation Radar (DPR) |
+| Product | 2A-DPR, Algorithm Version 9 (V07C) |
+| DOI | 10.5067/GPM/DPR/GPM/2A/07 |
+| Swaths | **FS** (Full Scan, Ku+Ka, 49 rays) and **HS** (High-Sensitivity, Ka-only, 24 rays) |
+| Along-track scans per granule | ~7 988 (`nscan`) |
+| Height bins per profile | 176 (`nbin`) |
+| Vertical bin spacing | ~125 m |
+| Data format | HDF5 (`.HDF5`) |
+| S3 bucket | `s3://airborne-smce-prod-user-bucket/JOIN/GPM-DPR/` |
+| Date range in bucket | 2026-01-19 – 2026-02-02 |
+| Total granules | 88 |
+
+---
+
+## S3 bucket organisation
+
+Files are arranged under a `{YYYY}/{MM}/{DD}/` hierarchy:
+
+```
+s3://airborne-smce-prod-user-bucket/JOIN/GPM-DPR/
+  2026/
+    01/
+      19/   ← 8 granules  (first available day)
+      20/   ← 8 granules
+      24/
+      25/
+      …
+      31/
+    02/
+      01/
+      02/   ← last available day
+```
+
+Each day contains 7–8 granule files, corresponding to roughly half the ~16
+daily GPM orbits (the remaining orbits are apparently not included in this
+collection).  Each granule covers one complete orbit (~95 min, global swath).
+File size is ~760–790 MB per granule.
+
+---
+
+## File naming convention
+
+```
+2A.GPM.DPR.V9-{algver}.{start}-S{hhmm}-E{hhmm}.{granule}.V07C.HDF5
+```
+
+Example:
+
+```
+2A.GPM.DPR.V9-20240130.20260119-S021222-E034532.067482.V07C.HDF5
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `2A` | — | Processing level: L2A swath |
+| `GPM` | — | Satellite |
+| `DPR` | — | Instrument |
+| `V9-20240130` | — | Algorithm version 9, dated 2024-01-30 |
+| `20260119` | — | Observation date (UTC) |
+| `S021222` | — | Granule start time: 02:12:22 UTC |
+| `E034532` | — | Granule end time: 03:45:32 UTC |
+| `067482` | — | Absolute granule number |
+| `V07C` | — | File format version |
+
+---
+
+## File contents
+
+Each HDF5 file contains two top-level swath groups and a metadata record:
+
+```
+/
+├── AlgorithmRuntimeInfo     ← processing log string
+├── FS/                      ← Full Scan swath  (Ku + Ka, 49 rays)
+│   ├── Latitude   (nscan, nray_fs)
+│   ├── Longitude  (nscan, nray_fs)
+│   ├── ScanTime/  ← per-scan time components
+│   ├── PRE/       ← pre-processing (surface clutter, echo flags, σ₀)
+│   ├── VER/       ← vertical echo structure
+│   ├── CSF/       ← column summary (bright band, precip type, hail flags)
+│   ├── SRT/       ← surface reference technique (PIA estimates)
+│   ├── DSD/       ← drop-size distribution
+│   ├── SLV/       ← DSD-based retrievals (precip rate, water content)
+│   ├── FLG/       ← quality flags
+│   ├── TRG/       ← dual-frequency triggering
+│   └── Experimental/
+└── HS/                      ← High-Sensitivity swath (Ka only, 24 rays)
+    ├── Latitude   (nscan, nray_hs)
+    ├── Longitude  (nscan, nray_hs)
+    ├── ScanTime/
+    ├── PRE/, VER/, CSF/, SRT/, DSD/, SLV/, FLG/
+    └── Experimental/
+```
+
+### Swath dimensions
+
+| Swath | Along-track (`nscan`) | Cross-track (`nray`) | Height bins (`nbin`) |
+|---|---|---|---|
+| `FS` (Full Scan) | 7 988 | 49 | 176 |
+| `HS` (High-Sensitivity) | 7 988 | 24 | 176 |
+
+### Geolocation and time
+
+| Dataset | Shape | dtype | Description |
+|---|---|---|---|
+| `FS/Latitude` | `(nscan, 49)` | float32 | Footprint latitude (°) |
+| `FS/Longitude` | `(nscan, 49)` | float32 | Footprint longitude (°) |
+| `FS/ScanTime/Year` | `(nscan,)` | int16 | UTC year |
+| `FS/ScanTime/Month` | `(nscan,)` | int8 | UTC month |
+| `FS/ScanTime/DayOfMonth` | `(nscan,)` | int8 | UTC day |
+| `FS/ScanTime/Hour` | `(nscan,)` | int8 | UTC hour |
+| `FS/ScanTime/Minute` | `(nscan,)` | int8 | UTC minute |
+| `FS/ScanTime/Second` | `(nscan,)` | int8 | UTC second |
+| `FS/ScanTime/SecondOfDay` | `(nscan,)` | float64 | Seconds from UTC midnight |
+
+### Selected science variables (`FS` swath)
+
+| Dataset | Shape | Units | Description |
+|---|---|---|---|
+| `FS/SLV/precipRate` | `(nscan, 49, 176)` | mm/hr | Precipitation rate profile |
+| `FS/SLV/precipRateNearSurface` | `(nscan, 49)` | mm/hr | Near-surface precip rate |
+| `FS/SLV/precipRateESurface` | `(nscan, 49)` | mm/hr | Estimated surface precip rate |
+| `FS/SLV/zFactorFinal` | `(nscan, 49, 176, 2)` | dBZ | Attenuation-corrected reflectivity (Ku, Ka) |
+| `FS/SLV/precipWater` | `(nscan, 49, 176)` | g/m³ | Precipitable water profile |
+| `FS/PRE/zFactorMeasured` | `(nscan, 49, 176, 2)` | dBZ | Measured reflectivity (Ku, Ka) |
+| `FS/PRE/flagPrecip` | `(nscan, 49)` | — | Precipitation flag |
+| `FS/PRE/height` | `(nscan, 49, 176)` | m | Range bin heights |
+| `FS/CSF/typePrecip` | `(nscan, 49)` | — | Precipitation type (stratiform/convective) |
+| `FS/CSF/flagBB` | `(nscan, 49)` | — | Bright-band detection flag |
+| `FS/CSF/heightBB` | `(nscan, 49)` | km | Bright-band height |
+| `FS/DSD/paramDSD` | `(nscan, 49, 176, 2)` | — | DSD parameters (D₀, Nw) |
+| `FS/FLG/qualityData` | `(nscan, 49)` | — | Overall data quality flag |
+
+Fill value: `-9999.9` (float32).
+
+### Global metadata attributes
+
+The file-level `FileHeader` attribute string contains key metadata:
+
+| Field | Example |
+|---|---|
+| `DOIshortName` | `2ADPR` |
+| `AlgorithmVersion` | `9.20240130` |
+| `SatelliteName` | `GPM` |
+| `InstrumentName` | `DPR` |
+| `StartGranuleDateTime` | `2026-01-19T02:12:22.166Z` |
+| `StopGranuleDateTime` | `2026-01-19T03:45:33.596Z` |
+| `GranuleNumber` | `67482` |
+| `NumberOfSwaths` | `2` |
+
+---
+
+## Creating a VirtualZarr IceChunk store
+
+The following demonstrates building an IceChunk store with virtual references
+to three consecutive `2A-DPR` granules from 2026-01-19, reading directly from
+their S3 URLs.
+
+The store targets the `FS/SLV` sub-group (core precipitation retrievals) and
+adds `FS/Latitude`, `FS/Longitude`, and a reconstructed `datetime64` time
+coordinate from `FS/ScanTime`.  Spatial dimensions are named `nscan`
+(along-track), `nray` (cross-track), and `nbin` (height bins).
+
+### Setup
+
+```{python}
+import os
+os.environ.setdefault("RUST_LOG", "error")
+
+import io
+import h5py
+import icechunk
+import numpy as np
+import xarray as xr
+import obstore
+from obstore.store import S3Store
+from obspec_utils.registry import ObjectStoreRegistry
+from virtualizarr.parsers import HDFParser
+from virtualizarr.writers.icechunk import virtual_dataset_to_icechunk
+import shutil
+from pathlib import Path
+```
+
+```{python}
+S3_BUCKET = "airborne-smce-prod-user-bucket"
+S3_PREFIX = "JOIN/GPM-DPR/2026/01/19"
+S3_REGION = "us-west-2"
+
+# Three consecutive granules from 2026-01-19
+GRANULES = [
+    f"s3://{S3_BUCKET}/{S3_PREFIX}/2A.GPM.DPR.V9-20240130.20260119-S021222-E034532.067482.V07C.HDF5",
+    f"s3://{S3_BUCKET}/{S3_PREFIX}/2A.GPM.DPR.V9-20240130.20260119-S034533-E051844.067483.V07C.HDF5",
+    f"s3://{S3_BUCKET}/{S3_PREFIX}/2A.GPM.DPR.V9-20240130.20260119-S051845-E065155.067484.V07C.HDF5",
+]
+
+STORE_DIR = Path("../_data/gpm-dpr/icechunk-stores/2adpr_demo").resolve()
+```
+
+### Helper: read coordinates from a granule
+
+`ScanTime` fields and lat/lon arrays are read eagerly per granule (~7 988 rows
+each) and assembled into a `datetime64` time vector and 2-D lat/lon grids.
+
+```{python}
+s3_store = S3Store.from_url(f"s3://{S3_BUCKET}/", region=S3_REGION)
+registry = ObjectStoreRegistry({f"s3://{S3_BUCKET}/": s3_store})
+
+
+def read_dpr_coords(url: str) -> dict:
+    """Read time, latitude, longitude from an FS swath granule."""
+    key = url.removeprefix(f"s3://{S3_BUCKET}/")
+    buf = io.BytesIO(obstore.get(s3_store, key).bytes())
+    with h5py.File(buf, "r") as f:
+        st  = f["FS/ScanTime"]
+        yr  = st["Year"][:]
+        mo  = st["Month"][:]
+        dy  = st["DayOfMonth"][:]
+        hr  = st["Hour"][:]
+        mi  = st["Minute"][:]
+        sc  = st["Second"][:]
+        ms  = st["MilliSecond"][:]
+        lat = f["FS/Latitude"][:]    # (nscan, nray)
+        lon = f["FS/Longitude"][:]   # (nscan, nray)
+
+    # Build datetime64 from components
+    iso = [
+        f"{int(y):04d}-{int(m):02d}-{int(d):02d}T"
+        f"{int(h):02d}:{int(mi_):02d}:{int(s):02d}.{int(ms_):03d}"
+        for y, m, d, h, mi_, s, ms_ in zip(yr, mo, dy, hr, mi, sc, ms)
+    ]
+    time_dt = np.array(iso, dtype="datetime64[ms]")
+    return {"time": time_dt, "latitude": lat, "longitude": lon}
+```
+
+### Open virtual datasets and attach coordinates
+
+We open `FS/SLV` in multiple passes — one per distinct variable shape family —
+because `phony_dim_*` indices are assigned per-dataset and variables with
+different sizes on the same phony dimension would conflict.  Each pass uses
+`drop_variables` to isolate one shape family, renames its dimensions, then all
+passes are merged.  Dimension names are taken directly from the `DimensionNames`
+attribute stored in the HDF5 file.
+
+The 2-D lat/lon arrays are stored as regular data variables (not dimension
+coordinates) because there is no single 1-D spatial axis.  Only `time` (along
+`nscan`) is used as a dimension coordinate for `.sel()`.
+
+```{python}
+# FS/SLV variable families, grouped by shape
+# (nscan, nray, nbin) — 3-D retrievals
+VARS_3D   = ["DFRforward1", "epsilon", "flagSLV", "precipRate", "precipWater"]
+# (nscan, nray) — 2-D surface/column quantities
+VARS_2D   = ["binEchoBottom", "phaseNearSurface", "precipRateAve24",
+             "precipRateESurface", "precipRateNearSurface", "qualitySLV"]
+# (nscan, nray, nbin, nDSD=2)
+VARS_4D_DSD  = ["paramDSD", "zFactorFinal"]
+# (nscan, nray, nfreq=2) — per-frequency
+VARS_3D_FREQ = ["piaFinal", "piaOffset", "sigmaZeroCorrected",
+                "zFactorFinalESurface", "zFactorFinalNearSurface"]
+# (nscan, nray, LS=2)
+VARS_3D_LS   = ["precipWaterIntegrated"]
+# (nscan, nray, nNUBF=3)
+VARS_3D_NUBF = ["paramNUBF"]
+
+ALL_VARS = (VARS_3D + VARS_2D + VARS_4D_DSD +
+            VARS_3D_FREQ + VARS_3D_LS + VARS_3D_NUBF)
+
+def open_slv_family(url, keep_vars, drop_others, dim_rename):
+    """Open FS/SLV, keep only keep_vars, rename phony dims."""
+    p = HDFParser(group="FS/SLV", drop_variables=drop_others)
+    vds = p(url, registry=registry).to_virtual_dataset()
+    return vds.rename(dim_rename)
+
+
+vds_list = []
+for url in GRANULES:
+    parts = []
+
+    # --- 3-D and 2-D (share phony_dim_0=nscan, phony_dim_1=nray, phony_dim_2=nbin) ---
+    drop = [v for v in ALL_VARS if v not in VARS_3D + VARS_2D]
+    p = HDFParser(group="FS/SLV", drop_variables=drop)
+    v = p(url, registry=registry).to_virtual_dataset()
+    v = v.rename({"phony_dim_0": "nscan", "phony_dim_1": "nray", "phony_dim_2": "nbin"})
+    parts.append(v)
+
+    # --- 4-D DSD: (nscan, nray, nbin, nDSD) ---
+    drop = [v for v in ALL_VARS if v not in VARS_4D_DSD]
+    p = HDFParser(group="FS/SLV", drop_variables=drop)
+    v = p(url, registry=registry).to_virtual_dataset()
+    v = v.rename({"phony_dim_0": "nscan", "phony_dim_1": "nray",
+                  "phony_dim_2": "nbin",  "phony_dim_3": "nDSD"})
+    parts.append(v)
+
+    # --- per-frequency (nscan, nray, nfreq) ---
+    drop = [v for v in ALL_VARS if v not in VARS_3D_FREQ]
+    p = HDFParser(group="FS/SLV", drop_variables=drop)
+    v = p(url, registry=registry).to_virtual_dataset()
+    v = v.rename({"phony_dim_0": "nscan", "phony_dim_1": "nray", "phony_dim_2": "nfreq"})
+    parts.append(v)
+
+    # --- liquid/solid (nscan, nray, LS) ---
+    drop = [v for v in ALL_VARS if v not in VARS_3D_LS]
+    p = HDFParser(group="FS/SLV", drop_variables=drop)
+    v = p(url, registry=registry).to_virtual_dataset()
+    v = v.rename({"phony_dim_0": "nscan", "phony_dim_1": "nray", "phony_dim_2": "LS"})
+    parts.append(v)
+
+    # --- NUBF params (nscan, nray, nNUBF) ---
+    drop = [v for v in ALL_VARS if v not in VARS_3D_NUBF]
+    p = HDFParser(group="FS/SLV", drop_variables=drop)
+    v = p(url, registry=registry).to_virtual_dataset()
+    v = v.rename({"phony_dim_0": "nscan", "phony_dim_1": "nray", "phony_dim_2": "nNUBF"})
+    parts.append(v)
+
+    # Merge all shape families
+    vds = xr.merge(parts)
+
+    # Eagerly read coordinates
+    coords = read_dpr_coords(url)
+
+    vds = vds.assign_coords(
+        time=("nscan", coords["time"],
+              {"long_name": "scan time", "timezone": "UTC"}),
+    ).assign(
+        latitude =xr.DataArray(coords["latitude"],  dims=["nscan", "nray"],
+                               attrs={"long_name": "latitude",  "units": "degrees_north"}),
+        longitude=xr.DataArray(coords["longitude"], dims=["nscan", "nray"],
+                               attrs={"long_name": "longitude", "units": "degrees_east"}),
+    ).set_index(nscan="time")
+
+    vds_list.append(vds)
+    print(f"  {url.split('/')[-1]}: {dict(vds.sizes)}")
+```
+
+### Write to an IceChunk store (append per granule)
+
+The HDF5 files use partial chunks at the end of `nscan`, so VirtualiZarr
+cannot concatenate virtual arrays directly.  We write the first granule and
+append subsequent ones using `virtual_dataset_to_icechunk`'s `append_dim`.
+
+```{python}
+shutil.rmtree(STORE_DIR, ignore_errors=True)
+STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+config = icechunk.RepositoryConfig.default()
+config.set_virtual_chunk_container(
+    icechunk.VirtualChunkContainer(
+        f"s3://{S3_BUCKET}/", icechunk.s3_store(region=S3_REGION)
+    )
+)
+repo = icechunk.Repository.create(
+    icechunk.local_filesystem_storage(str(STORE_DIR)), config=config
+)
+
+for i, (url, vds) in enumerate(zip(GRANULES, vds_list)):
+    session = repo.writable_session("main")
+    if i == 0:
+        virtual_dataset_to_icechunk(vds, session.store)
+    else:
+        virtual_dataset_to_icechunk(vds, session.store, append_dim="nscan")
+    session.commit(f"Append granule {i}: {url.split('/')[-1]}")
+    print(f"  committed granule {i}")
+
+print(f"Store written to {STORE_DIR}")
+```
+
+### Re-open and inspect
+
+```{python}
+repo2    = icechunk.Repository.open(
+    icechunk.local_filesystem_storage(str(STORE_DIR)),
+    authorize_virtual_chunk_access={f"s3://{S3_BUCKET}/": None},
+)
+ds = xr.open_zarr(
+    repo2.readonly_session("main").store,
+    consolidated=False,
+    mask_and_scale=True,   # replace _FillValue (-9999.9 / sentinels) with NaN
+)
+print(ds)
+print(f"\nTotal along-track scans: {ds.sizes['nscan']:,}")
+```
+
+The `time` coordinate enables time-based selection across all three granules:
+
+```{python}
+# Select a 15-minute window spanning the boundary between granules 0 and 1
+window = ds.sel(nscan=slice("2026-01-19T03:40", "2026-01-19T03:55"))
+print(f"Scans in window: {window.sizes['nscan']}")
+print(window[["latitude", "longitude", "precipRateNearSurface"]])
+```
+
+---
+
+## Visualizations
+
+### Global swath: near-surface precipitation rate
+
+The three granules together cover roughly a quarter of the globe.  We plot
+`precipRateNearSurface` for the nadir ray (ray index 24, swath centre) as a
+function of latitude and time.
+
+```{python}
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+FILL = -9999.9
+
+# Load nadir-ray near-surface precip for the full combined swath
+prate = ds["precipRateNearSurface"].isel(nray=24).values   # (nscan,)
+lat   = ds["latitude"].isel(nray=24).values                # (nscan,)
+# Fill values already NaN via mask_and_scale=True; keep only finite values for LogNorm
+prate = np.where(np.isfinite(prate) & (prate > 0), prate, np.nan)
+
+fig, ax = plt.subplots(figsize=(13, 3))
+sc = ax.scatter(lat, prate, c=prate, cmap="Blues", s=1,
+                norm=mcolors.LogNorm(vmin=0.1, vmax=50))
+plt.colorbar(sc, ax=ax, label="Near-surface precip rate (mm/hr)")
+ax.set_xlabel("Latitude (°N)")
+ax.set_ylabel("Precip rate (mm/hr)")
+ax.set_title("GPM 2A-DPR FS — Near-Surface Precipitation Rate (nadir ray)\n"
+             "3 granules · 2026-01-19 · ~02:12–06:52 UTC")
+ax.set_ylim(0, 60)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+### Vertical curtain: precipitation rate profile
+
+A curtain plot along the nadir ray for one granule.
+
+```{python}
+# One granule: 02:12–03:45 UTC
+gran0 = ds.sel(nscan=slice("2026-01-19T02:12", "2026-01-19T03:45"))
+pr    = gran0["precipRate"].isel(nray=24).values       # (nscan, nbin)
+lat0  = gran0["latitude"].isel(nray=24).values
+
+# Fill values already NaN; keep only positive values for LogNorm
+pr = np.where(np.isfinite(pr) & (pr > 0), pr, np.nan)
+
+# GPM-DPR range bins run top-down: bin 0 ≈ 22 km, bin 175 ≈ surface (~0 km).
+# Passing height in descending order puts high altitude at the top naturally.
+nbin = pr.shape[1]
+height_km = np.linspace(22, 0, nbin)
+
+fig, ax = plt.subplots(figsize=(14, 4))
+pcm = ax.pcolormesh(
+    lat0, height_km, pr.T,
+    norm=mcolors.LogNorm(vmin=0.1, vmax=50),
+    cmap="Blues", shading="auto"
+)
+plt.colorbar(pcm, ax=ax, label="Precipitation rate (mm/hr)", pad=0.01)
+ax.set_xlabel("Latitude (°N)")
+ax.set_ylabel("Altitude (km)")
+ax.set_title("GPM 2A-DPR FS — Precipitation Rate Profile (nadir ray)\n"
+             "Granule 067482 · 2026-01-19 02:12–03:45 UTC")
+plt.tight_layout()
+plt.show()
+```
+
+### Cross-track swath: near-surface precip for a 30-minute segment
+
+```{python}
+# 30-minute segment from granule 1
+seg = ds.sel(nscan=slice("2026-01-19T03:45", "2026-01-19T04:15"))
+prs = seg["precipRateNearSurface"].values        # (nscan, nray)
+lats = seg["latitude"].values                    # (nscan, nray)
+lons = seg["longitude"].values                   # (nscan, nray)
+prs  = np.where(np.isfinite(prs) & (prs > 0), prs, np.nan)
+
+fig, ax = plt.subplots(figsize=(8, 7))
+sc = ax.scatter(
+    lons.ravel(), lats.ravel(), c=prs.ravel(),
+    s=1, cmap="Blues",
+    norm=mcolors.LogNorm(vmin=0.1, vmax=50),
+)
+plt.colorbar(sc, ax=ax, label="Near-surface precip rate (mm/hr)")
+ax.set_xlabel("Longitude (°E)")
+ax.set_ylabel("Latitude (°N)")
+ax.set_title("GPM 2A-DPR FS — Full-Swath Near-Surface Precip Rate\n"
+             "03:45–04:15 UTC · 2026-01-19")
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
