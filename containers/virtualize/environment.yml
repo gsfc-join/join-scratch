@@ -1,0 +1,20 @@
+name: base
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  # Core data / cloud I/O
+  - obstore=0.9.*
+  - obspec_utils=0.9.*
+  - obspec=0.1.*
+  - h5py
+  - numpy
+  - xarray
+  # IceChunk + VirtualiZarr
+  - icechunk=2.0.*
+  - virtualizarr=2.6.*
+  - zarr=3.*
+  # AWS credential helpers (used by icechunk s3_storage from_env=True)
+  - boto3
+  - botocore
