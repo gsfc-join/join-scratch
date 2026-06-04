@@ -1,8 +1,6 @@
 [project]
 authors = [{name = "Alexey Shiklomanov", email = "alexey.shiklomanov@gmail.com"}]
-dependencies = [
-    "cartopy>=0.25.0",
-]
+dependencies = []
 name = "join-scratch"
 requires-python = ">= 3.11"
 version = "0.1.0"

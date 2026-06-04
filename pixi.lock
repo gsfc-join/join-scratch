@@ -11091,6 +11091,4 @@ packages:
   timestamp: 1764777166076
 - pypi: .
   name: join-scratch
-  requires_dist:
-  - cartopy>=0.25.0
   requires_python: '>=3.11'

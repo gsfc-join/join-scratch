@@ -16,11 +16,12 @@ Execution types
 """
 
 import argparse
+import dataclasses
 import io
 import logging
+import math
 import os
 import re
-import sys
 import time
 import uuid
 
@@ -31,6 +32,7 @@ import obstore
 import xarray as xr
 from obspec_utils.registry import ObjectStoreRegistry
 from obstore.store import S3Store
+from virtualizarr.manifests import ChunkManifest, ManifestArray
 from virtualizarr.parsers import HDFParser
 from virtualizarr.writers.icechunk import virtual_dataset_to_icechunk
 
@@ -56,6 +58,9 @@ DEFAULT_N_TEST       = 3
 EC_EPOCH  = np.datetime64("2000-01-01T00:00:00", "ns")
 EC_MISSING = -9999.0
 ORBIT_RE   = re.compile(r"_(\d{5}[BD])_")
+# Minimum plausible EarthCARE time value (seconds since EC_EPOCH).
+# Values below this are uninitialized fill.  700_000_000 s ≈ 2022-03.
+EC_MIN_TS  = 700_000_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +117,26 @@ def read_clp_coords(s3_store, key: str) -> dict:
         ts  = f["ScienceData/Geo/time"][:]
         lat = f["ScienceData/Geo/latitude"][:]
         lon = f["ScienceData/Geo/longitude"][:]
-    t = EC_EPOCH + (ts * 1e9).astype("int64").astype("timedelta64[ns]")
-    return {"time": t, "latitude": lat, "longitude": lon}
+
+    # Some granules (e.g. orbit 09505D) contain uninitialized trailing rows
+    # where time == 0 or a tiny denormalized float (both far below any real
+    # EarthCARE observation).  Find the last contiguous valid prefix.
+    valid_mask = ts >= EC_MIN_TS
+    n_valid = int(np.sum(valid_mask))
+    n_total = len(ts)
+    if n_valid < n_total:
+        log.warning(
+            "%s: dropping %d/%d trailing rows with invalid time values",
+            key, n_total - n_valid, n_total,
+        )
+
+    t = EC_EPOCH + (ts[:n_valid] * 1e9).astype("int64").astype("timedelta64[ns]")
+    return {
+        "time": t,
+        "latitude": lat[:n_valid],
+        "longitude": lon[:n_valid],
+        "n_valid": n_valid,
+    }
 
 
 def read_met_time(s3_store, key: str) -> np.ndarray:
@@ -134,6 +157,78 @@ def add_missing_value(vds: xr.Dataset) -> xr.Dataset:
     })
 
 
+def _trim_manifest_array(ma: ManifestArray, nalong_axis: int, n_valid: int) -> ManifestArray:
+    """Return a new ManifestArray with the nalong dimension trimmed to n_valid rows.
+
+    Keeps only the chunks needed to cover the first n_valid elements along
+    *nalong_axis*.  The last kept chunk may be partially filled — the virtual
+    reference still points to the original on-disk bytes; the engine will read
+    the full chunk and xarray/zarr will expose only the valid rows once the
+    dimension size is correctly set to n_valid.
+    """
+    chunk_shape = ma.chunks
+    nalong_chunk = chunk_shape[nalong_axis]
+    # Number of chunks along nalong needed to cover n_valid rows.
+    n_chunks_keep = math.ceil(n_valid / nalong_chunk)
+
+    raw = ma.manifest._paths  # numpy array of paths, shape = (n_chunks_0, n_chunks_1, ...)
+    # Slice only along nalong_axis.
+    slices = [slice(None)] * raw.ndim
+    slices[nalong_axis] = slice(0, n_chunks_keep)
+    new_paths   = raw[tuple(slices)]
+    new_offsets = ma.manifest._offsets[tuple(slices)]
+    new_lengths = ma.manifest._lengths[tuple(slices)]
+
+    # Build new ChunkManifest from dict representation.
+    entries: dict[str, dict] = {}
+    for idx in np.ndindex(new_paths.shape):
+        key = ".".join(str(i) for i in idx)
+        entries[key] = {
+            "path":   new_paths[idx],
+            "offset": int(new_offsets[idx]),
+            "length": int(new_lengths[idx]),
+        }
+    new_manifest = ChunkManifest(entries)
+
+    # New shape: replace nalong axis size with n_valid.
+    old_shape = ma.metadata.shape
+    new_shape = tuple(
+        n_valid if ax == nalong_axis else old_shape[ax]
+        for ax in range(len(old_shape))
+    )
+    new_metadata = dataclasses.replace(ma.metadata, shape=new_shape)
+    return ManifestArray(chunkmanifest=new_manifest, metadata=new_metadata)
+
+
+def trim_nalong(vds: xr.Dataset, n_valid: int) -> xr.Dataset:
+    """Return *vds* with every variable's nalong dimension trimmed to *n_valid*.
+
+    No-op when n_valid equals the current nalong size.
+    """
+    current = vds.sizes["nalong"]
+    if n_valid == current:
+        return vds
+
+    new_vars = {}
+    for name, var in vds.variables.items():
+        if "nalong" not in var.dims:
+            new_vars[name] = var
+            continue
+        ma = var.data
+        if not isinstance(ma, ManifestArray):
+            # Coordinate arrays are numpy — just slice directly.
+            nalong_axis = list(var.dims).index("nalong")
+            slices = [slice(None)] * var.ndim
+            slices[nalong_axis] = slice(0, n_valid)
+            new_vars[name] = xr.Variable(var.dims, var.values[tuple(slices)], var.attrs, var.encoding)
+            continue
+        nalong_axis = list(var.dims).index("nalong")
+        new_ma = _trim_manifest_array(ma, nalong_axis, n_valid)
+        new_vars[name] = xr.Variable(var.dims, new_ma, var.attrs, var.encoding)
+
+    return xr.Dataset(new_vars, attrs=vds.attrs)
+
+
 def make_clp_vds(s3_store, registry, bucket: str, key: str) -> xr.Dataset:
     url = f"s3://{bucket}/{key}"
     geo_p  = HDFParser(group="ScienceData/Geo")
@@ -145,6 +240,9 @@ def make_clp_vds(s3_store, registry, bucket: str, key: str) -> xr.Dataset:
                     "phony_dim_2": "nqflag"})
     vds = add_missing_value(xr.merge([vg, vd]))
     c = read_clp_coords(s3_store, key)
+    n_valid = c["n_valid"]
+    if n_valid < vds.sizes["nalong"]:
+        vds = trim_nalong(vds, n_valid)
     return (
         vds
         .assign_coords(
@@ -226,7 +324,15 @@ def main(argv=None):
 
     # Restrict for local-test
     if args.execution_type == "local-test":
-        common_orbits = common_orbits[: args.n_granules]
+        # Always include orbit 09505D (has trailing garbage rows) so the trim
+        # logic is exercised.  Fill remaining slots from the sorted list.
+        TEST_ORBIT = "09505D"
+        if TEST_ORBIT in common_orbits:
+            others = [o for o in common_orbits if o != TEST_ORBIT]
+            extra  = others[: max(0, args.n_granules - 1)]
+            common_orbits = sorted([TEST_ORBIT] + extra)
+        else:
+            common_orbits = common_orbits[: args.n_granules]
         log.info("[local-test] Processing %d granule(s): %s",
                  len(common_orbits), common_orbits)
 
