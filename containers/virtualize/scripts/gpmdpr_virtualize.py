@@ -19,8 +19,10 @@ import argparse
 import io
 import logging
 import os
+import re
 import time
 import uuid
+from datetime import datetime
 
 import h5py
 import icechunk
@@ -91,12 +93,33 @@ def parse_args(argv=None):
 # ---------------------------------------------------------------------------
 # S3 helpers
 # ---------------------------------------------------------------------------
+_GRANULE_TIME_RE = re.compile(r'\.(\d{8})-S(\d{6})-E\d{6}\.')
+
+
+def _granule_start_time(key: str) -> datetime:
+    """Parse the start datetime from a GPM granule filename key."""
+    fname = key.split("/")[-1]
+    m = _GRANULE_TIME_RE.search(fname)
+    if not m:
+        raise ValueError(f"Cannot parse start time from key: {key!r}")
+    date_str, s_str = m.group(1), m.group(2)
+    date = datetime.strptime(date_str, "%Y%m%d")
+    return date.replace(
+        hour=int(s_str[0:2]),
+        minute=int(s_str[2:4]),
+        second=int(s_str[4:6]),
+    )
+
+
 def list_s3_keys(s3_store, prefix: str) -> list[str]:
+    """List all S3 keys under *prefix*, sorted by granule start time."""
     keys = []
     for batch in obstore.list(s3_store, prefix=prefix):
         for item in batch:
             keys.append(item["path"])
-    return sorted(keys)
+    # Sort by parsed start timestamp rather than lexicographic string order so
+    # that granules spanning midnight (e.g. S234601-E011914) are placed correctly.
+    return sorted(keys, key=_granule_start_time)
 
 
 def delete_s3_prefix(s3_store, prefix: str) -> None:
@@ -131,8 +154,18 @@ def read_dpr_coords(s3_store, key: str) -> dict:
         f"{int(h):02d}:{int(n):02d}:{int(s):02d}.{int(x):03d}"
         for y, m, d, h, n, s, x in zip(yr, mo, dy, hr, mi, sc, ms)
     ]
+    times = np.array(iso, dtype="datetime64[ms]")
+
+    # Validate that time is strictly monotonically increasing within the granule.
+    if not np.all(times[1:] > times[:-1]):
+        bad = int(np.argmax(times[1:] <= times[:-1]))
+        raise ValueError(
+            f"Non-monotonic time in {key!r} at scan index {bad}: "
+            f"{times[bad]} >= {times[bad + 1]}"
+        )
+
     return {
-        "time":      np.array(iso, dtype="datetime64[ms]"),
+        "time":      times,
         "latitude":  lat,
         "longitude": lon,
     }
@@ -266,7 +299,12 @@ def main(argv=None):
     log.info("IceChunk store: s3://%s/%s", store_bucket, store_prefix)
 
     def find_resume_idx():
-        """Return (start_idx, already_has_data) for the root group / nscan dim."""
+        """Return (start_idx, already_has_data) for the root group / nscan dim.
+
+        Scans cumulative granule sizes and returns the index of the first granule
+        whose data is NOT yet in the store.  Uses strict ``>`` so that a granule
+        whose last scan is exactly the current store tail is NOT re-appended.
+        """
         try:
             ro = repo.readonly_session("main")
             ds = xr.open_zarr(ro.store, consolidated=False, mask_and_scale=False)
@@ -277,9 +315,10 @@ def main(argv=None):
         cumulative = 0
         for idx, vds in enumerate(vds_list):
             cumulative += vds.sizes["nscan"]
-            if cumulative >= current_size:
+            if cumulative > current_size:
                 log.info(
-                    "Resuming from granule %d/%d (store has %d nscan, expected %d after granule %d)",
+                    "Resuming from granule %d/%d (store has %d nscan, "
+                    "expected %d after granule %d)",
                     idx + 1, len(vds_list), current_size, cumulative, idx,
                 )
                 return idx, True
@@ -293,6 +332,23 @@ def main(argv=None):
         for i, (key, vds) in enumerate(zip(dpr_keys, vds_list)):
             if i < start_i:
                 continue
+
+            # Cross-granule monotonicity guard: the first scan of this granule
+            # must be strictly later than the last scan already in the store.
+            if i > 0 or has_data:
+                ro_check = repo.readonly_session("main")
+                ds_check = xr.open_zarr(ro_check.store, consolidated=False,
+                                        mask_and_scale=False)
+                store_last = ds_check.nscan.values[-1]
+                granule_first = vds.nscan.values[0]
+                if granule_first <= store_last:
+                    raise RuntimeError(
+                        f"Granule {i+1}/{len(dpr_keys)} ({key.split('/')[-1]}) "
+                        f"first scan {granule_first} is not after store tail "
+                        f"{store_last}; refusing to append (duplicate or "
+                        f"out-of-order granule)."
+                    )
+
             session = repo.writable_session("main")
             kwargs  = {}
             if i > 0 or has_data:
@@ -303,7 +359,7 @@ def main(argv=None):
                 log.info("  %d/%d committed", i + 1, len(dpr_keys))
         log.info("All granules written in %.1f s", time.monotonic() - t0)
 
-        # Verify store is readable
+        # Verify store is readable and time is monotonically increasing.
         log.info("Verifying store …")
         repo2 = icechunk.Repository.open(
             icechunk.s3_storage(
@@ -317,6 +373,14 @@ def main(argv=None):
         log.info("nscan: %d", ds.sizes["nscan"])
         log.info("Time range: %s – %s",
                  str(ds.nscan.values[0])[:19], str(ds.nscan.values[-1])[:19])
+        times = ds.nscan.values
+        if not np.all(times[1:] > times[:-1]):
+            bad = int(np.argmax(times[1:] <= times[:-1]))
+            raise RuntimeError(
+                f"Store time coordinate is not monotonically increasing at "
+                f"index {bad}: {times[bad]} >= {times[bad + 1]}"
+            )
+        log.info("Time coordinate is strictly monotonically increasing — OK.")
         log.info("Store verified OK.")
 
     finally:
