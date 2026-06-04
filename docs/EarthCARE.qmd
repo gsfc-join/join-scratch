@@ -270,6 +270,143 @@ def read_ec_coords(url: str) -> dict:
     return {"time": time_dt, "latitude": lat, "longitude": lon}
 ```
 
+Note that some EarthCARE granules (e.g. orbit 09505D) contain uninitialized trailing rows where time == 0 or a tiny denormalized float (both far below any real EarthCARE observation).
+Fortunately, these seem to occur only at the end of the granule boundary, which allows us to safely discard them with some Zarr trickery.
+Namely: We read the entire byte range for those chunks from the HDF5, but we manually change the array indices for those values to be less than the actual length of the array, so the trailing bad values are silently discarded.
+
+The relevant implementation looks like this:
+
+```python
+def read_clp_coords(s3_store, key: str) -> dict:
+    buf = io.BytesIO(obstore.get(s3_store, key).bytes())
+    with h5py.File(buf, "r") as f:
+        ts  = f["ScienceData/Geo/time"][:]
+        lat = f["ScienceData/Geo/latitude"][:]
+        lon = f["ScienceData/Geo/longitude"][:]
+
+    # Some granules (e.g. orbit 09505D) contain uninitialized trailing rows
+    # where time == 0 or a tiny denormalized float (both far below any real
+    # EarthCARE observation).  Find the last contiguous valid prefix.
+    valid_mask = ts >= EC_MIN_TS
+    n_valid = int(np.sum(valid_mask))
+    n_total = len(ts)
+    if n_valid < n_total:
+        log.warning(
+            "%s: dropping %d/%d trailing rows with invalid time values",
+            key, n_total - n_valid, n_total,
+        )
+
+    t = EC_EPOCH + (ts[:n_valid] * 1e9).astype("int64").astype("timedelta64[ns]")
+    return {
+        "time": t,
+        "latitude": lat[:n_valid],
+        "longitude": lon[:n_valid],
+        "n_valid": n_valid,
+    }
+
+def _trim_manifest_array(ma: ManifestArray, nalong_axis: int, n_valid: int) -> ManifestArray:
+    """Return a new ManifestArray with the nalong dimension trimmed to n_valid rows.
+
+    Keeps only the chunks needed to cover the first n_valid elements along
+    *nalong_axis*.  The last kept chunk may be partially filled — the virtual
+    reference still points to the original on-disk bytes; the engine will read
+    the full chunk and xarray/zarr will expose only the valid rows once the
+    dimension size is correctly set to n_valid.
+    """
+    chunk_shape = ma.chunks
+    nalong_chunk = chunk_shape[nalong_axis]
+    # Number of chunks along nalong needed to cover n_valid rows.
+    n_chunks_keep = math.ceil(n_valid / nalong_chunk)
+
+    raw = ma.manifest._paths  # numpy array of paths, shape = (n_chunks_0, n_chunks_1, ...)
+    # Slice only along nalong_axis.
+    slices = [slice(None)] * raw.ndim
+    slices[nalong_axis] = slice(0, n_chunks_keep)
+    new_paths   = raw[tuple(slices)]
+    new_offsets = ma.manifest._offsets[tuple(slices)]
+    new_lengths = ma.manifest._lengths[tuple(slices)]
+
+    # Build new ChunkManifest from dict representation.
+    entries: dict[str, dict] = {}
+    for idx in np.ndindex(new_paths.shape):
+        key = ".".join(str(i) for i in idx)
+        entries[key] = {
+            "path":   new_paths[idx],
+            "offset": int(new_offsets[idx]),
+            "length": int(new_lengths[idx]),
+        }
+    new_manifest = ChunkManifest(entries)
+
+    # New shape: replace nalong axis size with n_valid.
+    old_shape = ma.metadata.shape
+    new_shape = tuple(
+        n_valid if ax == nalong_axis else old_shape[ax]
+        for ax in range(len(old_shape))
+    )
+    new_metadata = dataclasses.replace(ma.metadata, shape=new_shape)
+    return ManifestArray(chunkmanifest=new_manifest, metadata=new_metadata)
+
+
+def trim_nalong(vds: xr.Dataset, n_valid: int) -> xr.Dataset:
+    """Return *vds* with every variable's nalong dimension trimmed to *n_valid*.
+
+    No-op when n_valid equals the current nalong size.
+    """
+    current = vds.sizes["nalong"]
+    if n_valid == current:
+        return vds
+
+    new_vars = {}
+    for name, var in vds.variables.items():
+        if "nalong" not in var.dims:
+            new_vars[name] = var
+            continue
+        ma = var.data
+        if not isinstance(ma, ManifestArray):
+            # Coordinate arrays are numpy — just slice directly.
+            nalong_axis = list(var.dims).index("nalong")
+            slices = [slice(None)] * var.ndim
+            slices[nalong_axis] = slice(0, n_valid)
+            new_vars[name] = xr.Variable(var.dims, var.values[tuple(slices)], var.attrs, var.encoding)
+            continue
+        nalong_axis = list(var.dims).index("nalong")
+        new_ma = _trim_manifest_array(ma, nalong_axis, n_valid)
+        new_vars[name] = xr.Variable(var.dims, new_ma, var.attrs, var.encoding)
+
+    return xr.Dataset(new_vars, attrs=vds.attrs)
+
+
+def make_clp_vds(s3_store, registry, bucket: str, key: str) -> xr.Dataset:
+    url = f"s3://{bucket}/{key}"
+    geo_p  = HDFParser(group="ScienceData/Geo")
+    data_p = HDFParser(group="ScienceData/Data")
+    vg = geo_p(url,  registry=registry).to_virtual_dataset()
+    vd = data_p(url, registry=registry).to_virtual_dataset()
+    vg = vg.rename({"phony_dim_0": "nalong", "phony_dim_1": "nheight"})
+    vd = vd.rename({"phony_dim_0": "nalong", "phony_dim_1": "nheight",
+                    "phony_dim_2": "nqflag"})
+    vds = add_missing_value(xr.merge([vg, vd]))
+    c = read_clp_coords(s3_store, key)
+    n_valid = c["n_valid"]
+    if n_valid < vds.sizes["nalong"]:
+        vds = trim_nalong(vds, n_valid)
+    return (
+        vds
+        .assign_coords(
+            time     =("nalong", c["time"],
+                        {"long_name": "observation time", "timezone": "UTC"}),
+            latitude =("nalong", c["latitude"],
+                        {"long_name": "latitude",  "units": "degrees_north"}),
+            longitude=("nalong", c["longitude"],
+                        {"long_name": "longitude", "units": "degrees_east"}),
+        )
+        .set_index(nalong="time")
+    )
+
+```
+
+Find the last contiguous valid prefix.
+
 ### Open virtual datasets and attach coordinates
 
 We open two virtual datasets per granule (`ScienceData/Geo` and
