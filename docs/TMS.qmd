@@ -1,0 +1,351 @@
+---
+title: "TROPICS Microwave Sounder (TMS) — Level 1B/1C Brightness Temperatures"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Overview
+
+**TROPICS** (Time-Resolved Observations of Precipitation structure and storm
+Intensity with a Constellation of Smallsats) is a NASA Earth Venture-Instrument
+mission.
+The **TMS** (TROPICS Microwave Sounder) is a 12-channel passive microwave
+radiometer spanning ~90–205 GHz aboard a constellation of CubeSats
+(TMS-02 through TMS-07), designed to measure precipitation and atmospheric
+temperature structure in tropical cyclones with rapid revisit times.
+
+The S3 bucket at `s3://airborne-smce-prod-user-bucket/JOIN/TMS/` holds
+multiple processing levels for satellites TMS-02 (Tomorrow-S02) and TMS-09
+(Tomorrow-S09), plus a merged 2025 archive (`1C-TCP_ALL`) covering six
+satellites.
+
+| Attribute | Value |
+|---|---|
+| Satellites | TMS-02 – TMS-07, TMS-09 (Tomorrow-S series) |
+| Agency | NASA |
+| Instrument | TROPICS Microwave Sounder (TMS) |
+| Channels | 12 (90–205 GHz) |
+| Spots per scan | 81 (native) or 128 (regridded) |
+| Data format | NetCDF-4 (flat; no groups) |
+| S3 bucket | `s3://airborne-smce-prod-user-bucket/JOIN/TMS/` |
+| Date range (TS02/TS09) | 2026-02-08 – 2026-02-19 |
+| Date range (1C-TCP_ALL) | 2025-01-01 – 2025-12-31 |
+| Total files | ~161 000+ |
+| Approx. total size | ~234 GB |
+
+---
+
+## S3 bucket organisation
+
+The bucket contains nine top-level product prefixes:
+
+```
+s3://airborne-smce-prod-user-bucket/JOIN/TMS/
+  TS02_L1B-TB/       ← TMS-02 L1B brightness temperatures (native)
+  TS02_L1B-TBR/      ← TMS-02 L1B resampled to ch10 boresight grid
+  TS02_L1C-TC/       ← TMS-02 L1C intercalibrated TBs
+  TS02_L1C-TCR/      ← TMS-02 L1C intercalibrated + regridded (equal spacing)
+  TS09_L1B-TB/       ← TMS-09 L1B brightness temperatures (native)
+  TS09_L1B-TBR/      ← TMS-09 L1B resampled
+  TS09_L1C-TC/       ← TMS-09 L1C intercalibrated TBs
+  TS09_L1C-TCR/      ← TMS-09 L1C intercalibrated + regridded
+  1C-TCP_ALL/        ← All-satellite 2025 L1C archive (TMS-02–07)
+```
+
+### `TS02_*` and `TS09_*` directories
+
+Files are arranged under a flat `{YYYYMMDD}/` date directory:
+
+```
+TS02_L1B-TB/
+  20260216/
+  20260217/
+  …
+  20260219/    ← ~36 granules/day (TS02) or ~100 granules/day (TS09)
+```
+
+Each granule is one ~2-minute orbit segment.
+
+### `1C-TCP_ALL`
+
+Uses a deeper `Y{YYYY}/M{MM}/D{DD}/` hierarchy and covers all of 2025:
+
+```
+1C-TCP_ALL/
+  Y2025/
+    M01/ – M12/
+      D01/ – D31/
+        ← ~36 granules/day × 6 satellites × two product types (1C-TC + 1C-TCR)
+```
+
+---
+
+## File naming convention
+
+All TMS files follow the same template:
+
+```
+TMS{sat}.{level}-{product}.V{version}.NRT.ST{start_ts}.ET{end_ts}.CT{create_ts}.nc
+```
+
+### Example
+
+```
+TMS02.1B-TB.V01-00.NRT.ST20260219-001118.ET20260219-002312.CT20260219-220644.nc
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `TMS02` | — | Satellite identifier (02–07, 09) |
+| `1B-TB` | — | Processing level and product type |
+| `V01-00` | — | Product version |
+| `NRT` | — | Processing mode: Near-Real-Time |
+| `ST20260219-001118` | — | Scene start time: 2026-02-19 00:11:18 UTC |
+| `ET20260219-002312` | — | Scene end time: 2026-02-19 00:23:12 UTC |
+| `CT20260219-220644` | — | File creation time: 2026-02-19 22:06:44 UTC |
+
+Product type codes:
+
+| Code | Description |
+|---|---|
+| `1B-TB` | L1B brightness temperatures (native boresight) |
+| `1B-TBR` | L1B brightness temperatures resampled to channel 10 boresight |
+| `1C-TC` | L1C intercalibrated brightness temperatures |
+| `1C-TCR` | L1C intercalibrated + regridded to equal-spacing (14.31 km) |
+| `1C-TCP` | L1C intercalibrated (used in the merged 1C-TCP_ALL archive) |
+
+---
+
+## Product hierarchy
+
+The four product levels build on each other in a processing chain:
+
+```
+L1B-TB  →  L1B-TBR  →  L1C-TC  →  L1C-TCR
+ (raw)   (resampled)  (xcal)    (gridded + limb-adjusted)
+```
+
+All products share the same spacecraft navigation, geometry, and flag
+variables.
+The science variable (`brightness_temperature`) is refined at each step.
+
+---
+
+## File contents
+
+### Shared dimensions (all products)
+
+| Dimension | Size | Description |
+|---|---|---|
+| `scans` | ~357–412 | Number of scan lines per granule |
+| `spots` | 81 | Cross-track FOVs per scan (native products) |
+| `channels` | 12 | Spectral channels |
+| `cal_spots` | 10 | Calibration sector spots |
+| `across_track_grid` | 128 | Equal-spaced grid width (TCR products only) |
+
+### Shared variables: spacecraft navigation
+
+Present in all four product types with shapes referenced to `(scans,)` or
+`(spots, scans)`.
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| `Year/Month/Day` | (scans,) | uint8/uint16 | UTC date components of scan | — |
+| `Hour/Minute/Second/Millisecond` | (scans,) | uint8/uint16 | UTC time components of scan | — |
+| `scLatitude` | (scans,) | float32 | Sub-satellite latitude | degrees_north |
+| `scLongitude` | (scans,) | float32 | Sub-satellite longitude | degrees_east |
+| `scAltitude` | (scans,) | float32 | Spacecraft altitude above WGS84 | km |
+| `scPosECEF` | (scans, 3) | float32 | Spacecraft ECEF position [x, y, z] | km |
+| `scVelECEF` | (scans, 3) | float32 | Spacecraft ECEF velocity [x, y, z] | km/s |
+| `scQuatECEF` | (scans, 4) | float32 | Body-to-ECEF quaternion [i, j, k, r] | — |
+| `scRollAngle` | (scans,) | float32 | Spacecraft roll angle | degrees |
+| `solar_beta_angle` | (scans,) | float32 | Satellite–sun vector angle from orbital plane | degrees |
+| `instrTemp` | (6, scans) | float32 | Average instrument temperatures (6 sensors) | °C |
+
+### Shared variables: per-FOV geometry and flags
+
+Present in L1B-TB, L1B-TBR, and L1C-TC (2D: spots × scans, or 3D including channels).
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| `latitude` | (spots, scans) or (spots, scans, channels) | float32 | FOV geodetic latitude | degrees_north |
+| `longitude` | (spots, scans) or (spots, scans, channels) | float32 | FOV geodetic longitude | degrees_east |
+| `elevation` | (spots, scans, channels) | float32 | Surface elevation (antenna-weighted) | m |
+| `land_fraction` | (spots, scans, channels) | float32 | Land fraction (antenna-pattern weighted) | — |
+| `clear_fraction` | (spots, scans, channels) | float32 | Cloud-clear fraction from geo cloud mask | — |
+| `sensor_view_angle` | (spots, scans) or (spots, scans, channels) | float32 | LOS scan angle from nadir | degrees |
+| `sensor_zenith_angle` | (spots, scans) | float32 | LOS zenith angle at surface | degrees |
+| `sensor_azimuth_angle` | (spots, scans) | float32 | LOS azimuth angle at surface | degrees |
+| `solar_zenith_angle` | (spots, scans, channels) | float32 | Solar zenith angle at surface | degrees |
+| `solar_azimuth_angle` | (spots, scans, channels) | float32 | Solar azimuth angle at surface | degrees |
+| `lunar_zenith_angle` | (spots, scans, channels) | float32 | Lunar zenith angle at surface | degrees |
+| `lunar_azimuth_angle` | (spots, scans, channels) | float32 | Lunar azimuth angle at surface | degrees |
+| `flagNonOcean` | (spots, scans, channels) | uint8 | Non-ocean flag (0=ocean, 1=land/coast) | — |
+| `flagAscDesc` | (spots, scans, channels) | uint8 | Orbit direction: 0=ascending, 1=descending | — |
+| `flagDayNight` | (spots, scans, channels) | uint8 | Day/night flag: 0=day, 1=night | — |
+| `flagLunarIntrusion` | (spots, scans, channels) | uint8 | Lunar intrusion into calibration sector | — |
+| `flagSolarIntrusion` | (spots, scans, channels) | uint8 | Solar intrusion into calibration sector | — |
+| `flagManeuver` | (spots, scans, channels) | uint8 | Spacecraft maneuver active | — |
+| `flagPLOrientation` | (spots, scans, channels) | uint8 | Payload orientation: 0=forward, 1=aft | — |
+| `NumGPSSats` | (spots, scans) | uint8 | Number of GPS satellites tracked | — |
+| `StarTrackerStatus` | (spots, scans) | uint8 | Star tracker status (0=OK, 1=Pending, 2=Bad, 3=Few stars) | — |
+| `AttitudeErrorDeg` | (spots, scans) | float32 | Estimated attitude error magnitude | degrees |
+| `MultiMask` | (spots, scans) | uint8 | Land/cloud mask (1=clear land, 2=cloudy ocean, 3=clear ocean, 4=cloudy land) | — |
+
+### Shared variables: calibration diagnostics
+
+Present in all products.
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| `cold_target_counts` | (scans, channels) | float32 | Mean deep space calibration counts | DN |
+| `noise_diode_counts` | (scans, channels) | float32 | Mean noise diode calibration counts | DN |
+| `internal_cal_target_counts` | (scans, channels) | float32 | Mean ICT calibration counts | DN |
+| `NEDT_DS` | (scans, channels) | float32 | NEDT from deep space (cold) calibration | K |
+| `NEDT_ND` | (scans, channels) | float32 | NEDT from noise diode calibration | K |
+| `NEDT_ICT` | (scans, channels) | float32 | NEDT from internal calibration target | K |
+| `Ta_ICT` | (scans, channels) | float32 | ICT antenna temperature | K |
+
+---
+
+### L1B-TB — Raw brightness temperatures
+
+Primary science variable and fields unique to this product level:
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| **`brightness_temperature`** | (spots, scans, channels) | float32 | Antenna-corrected TOA brightness temperature | K [0–350] |
+| `antenna_temperature_ND` | (spots, scans, channels) | float32 | Antenna temperature using noise diode as warm cal | K [0–350] |
+| `antenna_temperature_ICT` | (spots, scans, channels) | float32 | Antenna temperature using ICT as warm cal | K [0–350] |
+| `time` | (spots, scans, 2) | float64 | TROPICS epoch time of earth measurements (TAI seconds since 2000-01-01) | s |
+| `encoder_angle` | (spots, scans, 2) | float32 | Scanner encoder angle (0°=nadir) | degrees |
+| `encAngleEarthLimb` | (scans, channels) | float32 | Expected encoder angle of Earth limb | degrees |
+| `encAngleMaxDNGradient` | (scans, channels) | float32 | Encoder angle of max DN gradient near limb | degrees |
+| `flagICT_ND_Consistency` | (spots, scans, channels) | uint8 | ICT–ND consistency flag (0–3) | — |
+| `flagOutlierTimestamp` | (spots, scans, 2) | uint8 | Outlier timestamp flag | — |
+| `flagSDRTX` | (spots, scans, 2) | uint8 | SDR in transmit mode flag | — |
+| `flagColdCal` | (cal_spots, scans, channels) | uint8 | Cold space calibration outlier flag | — |
+| `flagNDCal` | (cal_spots, scans, channels) | uint8 | Noise diode calibration outlier flag | — |
+| `flagICTCal` | (cal_spots, scans, channels) | uint8 | ICT calibration outlier flag | — |
+
+---
+
+### L1B-TBR — Resampled brightness temperatures
+
+All TBs and geometry resampled to the **channel 10 (G3) boresight** grid,
+removing the channel dimension from lat/lon and most geometry variables.
+Adds an RFI flag and a combined quality flag not present in L1B-TB:
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| **`brightness_temperature`** | (spots, scans, channels) | float32 | TB resampled to ch10 boresight | K [0–350] |
+| `latitude` | (spots, scans) | float32 | Latitude at ch10 boresight | degrees_north |
+| `longitude` | (spots, scans) | float32 | Longitude at ch10 boresight | degrees_east |
+| `flagRFI` | (spots, scans, channels) | uint8 | Radio frequency interference flag | — |
+| `combinedQualityFlag` | (spots, scans, channels) | uint16 | 15-bit combined quality flag | — |
+
+---
+
+### L1C-TC — Intercalibrated brightness temperatures
+
+Intercalibrated relative to the TMS-S1 reference satellite using a
+neural-network-based cross-calibration model.
+Replaces `brightness_temperature` with the intercalibrated variable and adds
+an uncertainty estimate:
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| **`brightness_temperature_xcal`** | (spots, scans, channels) | float32 | Intercalibrated TB (adjusted to TMS-S1 spectral response) | K [0–350] |
+| **`xcal_std`** | (spots, scans, channels) | float32 | Intercalibration 1-sigma uncertainty | K [0–20] |
+
+All flags, geometry, calibration diagnostics, and spacecraft navigation
+variables are carried over from L1B-TBR unchanged.
+
+---
+
+### L1C-TCR — Intercalibrated and regridded brightness temperatures
+
+TBs regridded to a **uniform 14.31 km equal-spaced cross-track grid**
+(128 points).
+Provides limb-adjusted variants for improved radiance consistency at large
+scan angles.
+This product uses `across_track_grid` (128) instead of `spots` (81) for
+science variables, and spacecraft navigation reduces to per-scan scalars.
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| **`brightness_temperature_gridded`** | (128, scans, channels) | float32 | TB on equal-spaced grid | K [0–350] |
+| **`brightness_temperature_xcal_gridded`** | (128, scans, channels) | float32 | Intercalibrated TB on equal-spaced grid | K [0–350] |
+| **`brightness_temperature_limb`** | (128, scans, channels) | float32 | Gridded TB with limb adjustment | K [0–350] |
+| **`brightness_temperature_xcal_limb`** | (128, scans, channels) | float32 | Gridded intercalibrated TB with limb adjustment | K [0–350] |
+| `latitude` | (128, scans) | float32 | Latitude on equal-spaced grid | degrees |
+| `longitude` | (128, scans) | float32 | Longitude on equal-spaced grid | degrees |
+| `scan_angle` | (128, scans) | float32 | Sensor scan angle on equal-spaced grid | degrees |
+| `zenith_angle` | (128, scans) | float32 | Sensor zenith angle on grid | degrees |
+| `azimuth_angle` | (128, scans) | float32 | Sensor azimuth angle on grid | degrees |
+| `land_fraction` | (128, scans) | float32 | Land fraction at W-band resolution | — |
+| `elevation` | (128, scans) | float32 | Surface elevation at W-band on grid | m |
+
+---
+
+### `1C-TCP_ALL` — Merged 2025 L1C archive
+
+Contains L1C-TC and L1C-TCR files (see above) for **six TMS satellites**
+(TMS-02 through TMS-07) covering the full calendar year 2025.
+Variable structure is identical to the per-satellite L1C-TC/TCR products
+described above.
+The primary difference from the 2026 near-real-time products is the
+cross-calibration model version (`V00-05`, an earlier approach referencing
+TMS-SN01 rather than the ideal spectral response).
+
+Files in `1C-TCP_ALL` are organised under `Y{YYYY}/M{MM}/D{DD}/`, covering
+both `1C-TC` and `1C-TCR` product types for all six constellation members.
+
+---
+
+## Opening files with Python
+
+All TMS files are standard flat NetCDF-4 and can be opened directly:
+
+```python
+import xarray as xr
+
+# L1B-TB, L1B-TBR, L1C-TC — native (81 spots) products
+ds = xr.open_dataset(
+    "TMS02.1C-TC.V01-00.NRT.ST20260219-001118.ET20260219-002312.CT20260219-220644.nc"
+)
+print(ds["brightness_temperature_xcal"])   # (81, scans, 12)
+
+# L1C-TCR — regridded (128 grid points) product
+ds_r = xr.open_dataset(
+    "TMS02.1C-TCR.V01-00.NRT.ST20260219-001118.ET20260219-002312.CT20260219-220644.nc"
+)
+print(ds_r["brightness_temperature_xcal_gridded"])  # (128, scans, 12)
+```
+
+To read directly from S3 using obstore:
+
+```python
+import io
+import xarray as xr
+import obstore
+from obstore.store import S3Store
+
+S3_BUCKET = "airborne-smce-prod-user-bucket"
+S3_REGION = "us-west-2"
+S3_PREFIX = "JOIN/TMS/TS02_L1C-TC/20260219"
+
+store = S3Store.from_url(f"s3://{S3_BUCKET}/", region=S3_REGION)
+
+# List granules for a date
+files = [obj["key"] for obj in obstore.list(store, prefix=f"{S3_PREFIX}/").collect()]
+
+# Open one granule
+raw = bytes(obstore.get(store, files[0]).bytes())
+ds = xr.open_dataset(io.BytesIO(raw))
+print(ds)
+```

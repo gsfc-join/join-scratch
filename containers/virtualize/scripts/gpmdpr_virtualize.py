@@ -19,7 +19,6 @@ import argparse
 import io
 import logging
 import os
-import sys
 import time
 import uuid
 

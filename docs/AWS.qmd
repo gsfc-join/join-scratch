@@ -1,0 +1,301 @@
+---
+title: "Arctic Weather Satellite (AWS) — Level 1B Microwave Radiances"
+format:
+  html:
+    code-fold: false
+    toc: true
+    toc-depth: 3
+jupyter: python3
+---
+
+## Overview
+
+The **Arctic Weather Satellite (AWS)** is an ESA mission designed to improve
+numerical weather prediction in the Arctic.
+AWS-1 carries a 19-channel Microwave Radiometer (MWR) spanning frequencies
+from ~23 GHz to ~183 GHz, enabling tropospheric temperature and humidity
+profiling under all weather conditions.
+
+The S3 bucket at `s3://airborne-smce-prod-user-bucket/JOIN/AWS/` holds Level 1B
+radiance and brightness temperature products processed by KSAT (Kongsberg
+Satellite Services) in Near-Real-Time (NRT) mode.
+
+| Attribute | Value |
+|---|---|
+| Satellite | AWS-1 |
+| Agency | ESA |
+| Instrument | Microwave Radiometer (MWR) |
+| Channels | 19 |
+| Processing level | 1B — antenna-corrected TOA brightness temperatures and radiances |
+| Data format | NetCDF-4 (inside a ZIP archive; `.nc` extension) |
+| S3 bucket | `s3://airborne-smce-prod-user-bucket/JOIN/AWS/` |
+| Date range in bucket | 2026-01-23 – 2026-02-18 |
+| Total granules | 406 |
+| Approx. total size | ~59 GB |
+
+---
+
+## S3 bucket organisation
+
+Files are arranged under a `{YYYY}/{MM}/{DD}/` hierarchy:
+
+```
+s3://airborne-smce-prod-user-bucket/JOIN/AWS/
+  2026/
+    01/
+      23/   ← 1 granule
+      24/   ← 1 granule
+      …
+      31/
+    02/
+      01/   ← ~10–15 granules/day
+      …
+      18/
+```
+
+January coverage is sparse (1 granule per day); February coverage is denser
+(10–15 granules per day, typically one ~90-minute orbit per file).
+
+---
+
+## File naming convention
+
+Files follow the WMO/EUMETSAT standard filename format:
+
+```
+W_NO-KSAT-Tromso,SAT,AWS1-MWR-1B-RAD_C_OHB__{creation_ts}_G_O_{start_ts}_{end_ts}_C_N____.nc
+```
+
+### Example
+
+```
+W_NO-KSAT-Tromso,SAT,AWS1-MWR-1B-RAD_C_OHB__20260124121256_G_O_20260124102804_20260124120437_C_N____.nc
+```
+
+| Field | Example | Meaning |
+|---|---|---|
+| `W_NO-KSAT-Tromso` | — | WMO format; originating ground station (Tromsø, Norway) |
+| `SAT,AWS1` | — | Platform: Arctic Weather Satellite 1 |
+| `MWR-1B-RAD` | — | Instrument, processing level, product type |
+| `20260124121256` | — | File creation time (UTC): 2026-01-24 12:12:56 |
+| `20260124102804` | — | Sensing start time (UTC): 2026-01-24 10:28:04 |
+| `20260124120437` | — | Sensing stop time (UTC): 2026-01-24 12:04:37 |
+
+**Important:** Despite the `.nc` extension, each file is a **ZIP archive**
+containing a NetCDF-4 data file plus `EOPMetadata.xml` and `manifest.xml`
+sidecar files.
+The NetCDF file inside must be extracted before opening.
+
+---
+
+## File contents
+
+Each granule is a NetCDF-4 file with three top-level groups:
+`status`, `data`, and `quality`.
+
+```
+/
+├── status/
+│   ├── satellite/   ← orbital elements, attitude errors
+│   └── instrument/  ← channel frequencies, calibration coefficients, housekeeping
+├── data/
+│   ├── navigation/      ← per-FOV geolocation, angles, surface type
+│   ├── measurement/     ← raw earth/cold/warm counts
+│   └── calibration/     ← TOA brightness temperatures, radiances, calibration terms
+│       processing_information/  ← per-scan and per-channel quality flags
+└── quality/             ← summary quality flags, data coverage statistics
+```
+
+A typical granule covers ~90 minutes and contains
+**4 866 scans × 145 FOVs/scan × 19 channels**.
+
+### `status/satellite`
+
+Orbital and attitude metadata.
+Scalar values describe the epoch state vector; (n_fovs,) arrays give
+per-FOV attitude error estimates.
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| `epoch_time_utc` | () | float64 | UTC epoch of orbital elements | s since 2020-01-01 |
+| `semi_major_axis` | () | float64 | Semi-major axis at epoch | m |
+| `eccentricity` | () | float64 | Orbital eccentricity | — |
+| `inclination` | () | float64 | Inclination at epoch | degrees |
+| `perigee_argument` | () | float64 | Argument of perigee | degrees |
+| `right_ascension` | () | float64 | Right ascension of ascending node | degrees |
+| `mean_anomaly` | () | float64 | Mean anomaly at epoch | degrees |
+| `earth_sun_distance_ratio` | () | float64 | Earth–Sun distance ratio | — |
+| `subsat_latitude_start/end` | () | float64 | Sub-satellite latitude at granule start/end | degrees_north |
+| `subsat_longitude_start/end` | () | float64 | Sub-satellite longitude at granule start/end | degrees_east |
+| `state_vector_time_utc` | () | float64 | UTC time of orbit state vector | s since 2020-01-01 |
+| `x/y/z_position` | () | float64 | ECEF spacecraft position components | m |
+| `x/y/z_velocity` | () | float64 | ECEF spacecraft velocity components | m/s |
+| `yaw_error` | (145,) | float64 | Yaw attitude error per FOV | degrees |
+| `roll_error` | (145,) | float64 | Roll attitude error per FOV | degrees |
+| `pitch_error` | (145,) | float64 | Pitch attitude error per FOV | degrees |
+| `leap_second_time_utc` | () | float64 | Time of applicable leap second | s since 2020-01-01 |
+| `leap_second_value` | () | int16 | Leap second value (+1/−1/0) | seconds |
+
+### `status/instrument`
+
+Instrument configuration and housekeeping.
+Key dimensions: `n_scans` (4 866), `n_channels` (19), `n_fovs` (145).
+
+| Variable | Shape | Description |
+|---|---|---|
+| `channel_central_freq` | (19,) | Central frequency of each channel (GHz) |
+| `channel_bandwidths` | (19,) | Channel bandwidth (Hz) |
+| `channel_central_wavenum` | (19,) | Central wavenumber (cm⁻¹) |
+| `mirror_reflectivity_perpendicular` | (145, 19) | Per-FOV per-channel mirror reflectivity |
+| `aws_thermistor` | (4866, 4) | Thermistor readings (counts) |
+| `aws_prt` | (4866, 4) | Platinum resistance thermometer readings (counts) |
+| `aws_sdss` | (4866, 19) | Sample data saturation status |
+| `aws_sma_assembly_status` | (4866,) | Scan mechanism assembly status |
+
+### `data/navigation`
+
+Per-scan and per-FOV geolocation and geometry.
+Many variables use a 4th dimension (`n_geo_groups: 4`) corresponding to
+different geo-location groups (e.g., different frequency bands).
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| `time_startscan_utc_earthview` | (4866,) | float64 | UTC time at start of each earth-view scan | s since 2020-01-01 |
+| `aws_lat` | (4866, 145, 4) | int32 | FOV latitude (scale: 0.0001) | degrees_north |
+| `aws_lon` | (4866, 145, 4) | int32 | FOV longitude (scale: 0.0001) | degrees_east |
+| `aws_solar_zenith_angle` | (4866, 145, 4) | uint16 | Solar zenith angle (scale: 0.01) | degrees |
+| `aws_solar_azimuth_angle` | (4866, 145, 4) | uint16 | Solar azimuth angle (scale: 0.01) | degrees |
+| `aws_satellite_zenith_angle` | (4866, 145, 4) | uint16 | Satellite zenith angle (scale: 0.01) | degrees |
+| `aws_satellite_azimuth_angle` | (4866, 145, 4) | uint16 | Satellite azimuth angle (scale: 0.01) | degrees |
+| `satellite_altitude` | (4866,) | uint32 | Spacecraft altitude above geoid (scale: 0.1) | km |
+| `orbit_angle` | (4866,) | uint16 | Angular position in orbit (scale: 0.01) | degrees |
+| `aws_rollang` | (4866,) | int16 | Spacecraft roll angle (scale: 0.01) | degrees |
+| `aws_yawang` | (4866,) | int16 | Spacecraft yaw angle (scale: 0.01) | degrees |
+| `aws_pitchang` | (4866,) | int16 | Spacecraft pitch angle (scale: 0.01) | degrees |
+| `aws_surface_type` | (4866, 145, 4) | int16 | Land fraction of pixel | — |
+| `aws_terrain_elevation` | (4866, 145, 4) | int16 | Average terrain elevation | m |
+| `aws_moon_angles` | (4866, 25, 4) | uint16 | Moon–space view angle | degrees |
+| `aws_sun_angles` | (4866, 145, 4) | uint16 | Sun–scene view angle | degrees |
+
+### `data/measurement`
+
+Raw instrument counts before calibration.
+
+| Variable | Shape | Dtype | Description |
+|---|---|---|---|
+| `aws_scan_number` | (4866,) | int32 | Scan line number |
+| `aws_earth_view_counts` | (4866, 145, 19) | int32 | Earth scene raw counts |
+| `aws_cold_view_counts` | (4866, 25, 19) | int32 | Cold calibration (space view) counts |
+| `aws_warm_view_counts` | (4866, 15, 19) | int32 | Warm calibration (on-board target) counts |
+| `aws_earth_view_counts_os_stdev` | (145, 19) | uint32 | Std dev of oversampled earth view counts |
+| `aws_antennapos_counts_earthview` | (4866, 145) | uint32 | Earth pixel antenna position (counts) |
+| `aws_antennapos_counts_coldview` | (4866, 25) | uint32 | Cold target antenna position (counts) |
+| `aws_antennapos_counts_warmview` | (4866, 15) | uint32 | Warm target antenna position (counts) |
+
+### `data/calibration`
+
+Calibrated geophysical output and calibration diagnostics.
+The two primary science variables are:
+
+| Variable | Shape | Dtype | Description | Units |
+|---|---|---|---|---|
+| **`aws_toa_brightness_temperature`** | (4866, 145, 19) | int32 | Antenna-corrected TOA brightness temperature (scale: 0.001) | K |
+| **`aws_toa_radiance`** | (4866, 145, 19) | int32 | Antenna-corrected TOA radiance (scale: 1×10⁻²⁵) | mW/(m²·sr·Hz) |
+
+Additional calibration diagnostics:
+
+| Variable | Shape | Description | Units |
+|---|---|---|---|
+| `aws_nedt_warm` | (4866, 19) | NEDT (noise equiv. ΔT), warm load | K |
+| `aws_nedt_cold` | (4866, 19) | NEDT, cold load | K |
+| `warm_target_temperature` | (4866, 15, 19) | Warm target temperature | K |
+| `cold_target_temperature` | (4866, 25, 19) | Cold target temperature | K |
+| `warm_target_radiance` | (4866, 15, 19) | Warm target radiance | mW/(m²·sr·Hz) |
+| `cold_target_radiance` | (4866, 25, 19) | Cold target radiance | mW/(m²·sr·Hz) |
+| `inst_temperature` | (4866,) | Instrument temperature | K |
+| `prt_resistance` | (4866, 4) | PRT resistance (on-board cal target) | Ω |
+| `primary_calibration_zero_order_term` | (4866, 19) | a₀ calibration coefficient | K |
+| `primary_calibration_first_order_term` | (4866, 19) | a₁ calibration coefficient | K/V |
+| `nonlinearity_correction` | (4866, 19) | Nonlinearity correction term | K |
+| `postdetection_amplifier_gain` | (4866, 19) | Post-detection amplifier gain | — |
+| `cal_mirror_temperature` | (4866,) | Calibration mirror temperature (scale: 0.001) | K |
+| `cal_mirror_correction_factor` | (4866, 145, 19) | Cal mirror emission impact on gain (scale: 0.001) | K |
+| `warm_target_effective_temperature` | (4866, 19) | Effective warm target temperature (scale: 0.001) | K |
+| `cold_target_effective_temperature` | (4866, 19) | Effective cold target temperature (scale: 0.001) | K |
+| `counts_warmview_average_over_scans` | (4866, 19) | Mean warm target count over scans | counts |
+| `counts_coldview_average_over_scans` | (4866, 19) | Mean cold target count over scans | counts |
+
+### `data/processing_information`
+
+Per-scan, per-channel, and per-FOV quality and processing flags.
+All variables are integer dtype (int8 or uint32).
+Key flags:
+
+| Variable | Shape | Description |
+|---|---|---|
+| `aws_navigation_status` | (4866,) | Navigation availability flag |
+| `aws_calibration_flag` | (4866, 19) | Calibration quality flag per channel |
+| `aws_nedt_flag` | (4866, 19) | NEDT quality flag |
+| `aws_brightnesstemp_flag` | (4866, 145, 19) | Per-FOV brightness temperature quality |
+| `aws_scanline_quality` | (4866,) | Overall scan quality |
+| `aws_channel_quality_flag` | (4866, 19) | Per-channel data quality |
+| `aws_moon_contamination_flag` | (4866, 19) | Lunar contamination in calibration views |
+| `aws_sun_contamination_flag` | (4866, 19) | Solar contamination flag |
+| `aws_surface_flag` | (4866, 145, 4) | Surface type/coverage flag |
+| `scan_angle_out_of_limits_flag` | (4866,) | Scan angle out-of-limits indicator |
+| `scan_time_anomaly` | (4866,) | Scan time anomaly flag |
+
+### `quality`
+
+Granule-level quality summary.
+
+| Variable | Shape | Dtype | Description |
+|---|---|---|---|
+| `L1B_quality_flag` | (4866,) | uint32 | Overall earth/cold/warm count quality |
+| `degraded_channels` | (19,) | uint32 | Per-channel degradation flags |
+| `duration_of_product` | () | float64 | Total product duration (s) |
+| `duration_of_data_present` | () | float64 | Duration with valid data (s) |
+| `duration_of_data_missing` | () | float64 | Duration with missing data (s) |
+| `duration_of_data_degraded` | () | float64 | Duration with degraded data (s) |
+| `count_missing_scanlines` | () | uint32 | Number of missing scan lines |
+| `gap_start_time_utc` | (gap_items,) | float64 | Gap start times in UTC |
+| `gap_end_time_utc` | (gap_items,) | float64 | Gap end times in UTC |
+
+---
+
+## Opening a file with Python
+
+Because each `.nc` file is actually a ZIP archive, it must be extracted before
+use.
+The following snippet downloads a file from S3, extracts the inner NetCDF, and
+opens it with xarray:
+
+```python
+import zipfile
+import io
+import xarray as xr
+import obstore
+from obstore.store import S3Store
+
+S3_BUCKET = "airborne-smce-prod-user-bucket"
+S3_REGION = "us-west-2"
+
+key = ("JOIN/AWS/2026/01/24/"
+       "W_NO-KSAT-Tromso,SAT,AWS1-MWR-1B-RAD_C_OHB__20260124121256"
+       "_G_O_20260124102804_20260124120437_C_N____.nc")
+
+store = S3Store.from_url(f"s3://{S3_BUCKET}/", region=S3_REGION)
+raw = bytes(obstore.get(store, key).bytes())
+
+# The .nc file is a ZIP archive — extract the inner NetCDF
+with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+    nc_name = [n for n in zf.namelist() if n.endswith(".nc")][0]
+    nc_bytes = zf.read(nc_name)
+
+ds = xr.open_dataset(io.BytesIO(nc_bytes), group="data/calibration")
+print(ds)
+```
+
+To access a specific group, pass the `group=` argument to `xr.open_dataset`
+(e.g. `group="data/navigation"` for geolocation arrays,
+`group="data/calibration"` for brightness temperatures).
