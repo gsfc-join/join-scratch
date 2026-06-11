@@ -101,8 +101,8 @@ def create_scrip_grid(
 
 
 # Load weights
-def load_weights(fname: str | Path):
-    ds = xr.open_dataset(fname, engine="h5netcdf")
+def load_weights(fname: str | Path, **kwargs):
+    ds = xr.open_dataset(fname, **kwargs)
     S = ds["S"].values
     row = ds["row"].values - 1
     col = ds["col"].values - 1
@@ -204,8 +204,17 @@ amsr2_scrip.to_netcdf(amsr2_scrip_nc4, format="NETCDF4")
 ################################################################################
 # Generate ESMF weights
 
-esmf_out = tmp_dir / "weights.nc4"
-if not esmf_out.exists():
+esmf_out_s3 = f"s3://{bucket_name}/JOIN/cached-weights/GCOM-W1-AMSR2-L3-SND/lis-1km-missouri.zarr"
+try:
+    log.info("Trying to load existing weights at %s", str(esmf_out_s3))
+    W = load_weights(esmf_out_s3)
+    log.info("Loaded existing weights!")
+except ValueError as e:
+    log.warning(
+        f"Could not read existing weights with error {str(e)}. ",
+        "Recreating weights locally."
+    )
+    esmf_out_tmp = tmp_dir / "weights.nc4"
     cmd = [
         "ESMF_RegridWeightGen",
         "--source",
@@ -213,7 +222,7 @@ if not esmf_out.exists():
         "--destination",
         str(lis_scrip_nc4),
         "--weight",
-        str(esmf_out),
+        str(esmf_out_tmp),
         "--method",
         "bilinear",
         "--src_type",
@@ -225,11 +234,10 @@ if not esmf_out.exists():
     ]
     log.info("Running %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
-    print(result.stdout)
-else:
-    log.info("Using existing weights at %s", str(esmf_out))
-
-W = load_weights(esmf_out)
+    # Cache the weights to zarr on S3
+    log.info("Saving weights to S3 %s", " ".join(cmd))
+    xr.open_dataset(esmf_out_tmp, engine="h5netcdf").to_zarr(esmf_out_s3)
+    W = load_weights(esmf_out_tmp)
 
 ################################################################################
 # Create result dataset
@@ -253,3 +261,4 @@ result_da = xr.concat(regridded_slices, dim=pd.Index(time_values, name="time"))
 result = result_da.to_dataset(name = "snow_depth_amsr2")
 s3_tmp = f"s3://{bucket_name}/JOIN/outputs-preliminary"
 result.to_zarr(f"{s3_tmp}/amsr2-regridded.zarr")
+
