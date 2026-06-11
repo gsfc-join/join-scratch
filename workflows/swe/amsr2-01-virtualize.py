@@ -22,6 +22,8 @@ from zarr.codecs import Zlib
 import xarray as xr
 import pandas as pd
 
+from tqdm import tqdm
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ FNAME_TMPL   = "GW1AM2_{date}_01D_{orbit}_L3SGSNDHG2210210.h5"
 ORBIT_CODES  = ["EQMA",        "EQMD"       ]
 ORBIT_LABELS = ["Ascending",   "Descending" ]
 
+STORE_URL = "s3://"
 STORE_DIR = Path("/tmp/amsr2-store-multi").resolve()
 
 # CF time reference
@@ -118,7 +121,7 @@ def _get_manifests(chunk_url: str) -> tuple:
     return ma.manifest, attrs
 
 
-def create_store(store_dir: Path, overwrite: bool = False) -> icechunk.Repository:
+def initialize_store(session: icechunk.Session, commit_msg: str = "Initialize empty store") -> None:
     """
     Create a fresh IceChunk repository at *store_dir*.
 
@@ -126,43 +129,31 @@ def create_store(store_dir: Path, overwrite: bool = False) -> icechunk.Repositor
     ----------
     store_dir : Path
         Directory for the IceChunk repository.
-    overwrite : bool
-        If True, delete any existing repository first.
     """
-    if overwrite:
-        shutil.rmtree(store_dir, ignore_errors=True)
-    store_dir.mkdir(parents=True, exist_ok=True)
-
-    config = icechunk.RepositoryConfig.default()
-    config.set_virtual_chunk_container(
-        icechunk.VirtualChunkContainer(
-            "https://gportal.jaxa.jp/", icechunk.http_store()
-        )
-    )
-    repo = icechunk.Repository.create(
-        icechunk.local_filesystem_storage(str(store_dir)), config=config
-    )
 
     lats = np.linspace(89.95, -89.95, NLAT).astype("float32")
-    lons = np.linspace(0.05,  359.95, NLON).astype("float32")
+    lons = np.linspace(0.05, 359.95, NLON).astype("float32")
 
-    session = repo.writable_session("main")
-    root    = zarr.open_group(session.store, mode="w", zarr_format=3)
+    root = zarr.open_group(session.store, mode="w", zarr_format=3)
 
     # ── coordinate arrays ─────────────────────────────────────────────────────
     root.require_array(
         "time",
-        shape=(0,), chunks=(512,), dtype="int32",
+        shape=(0,),
+        chunks=(512,),
+        dtype="int32",
         dimension_names=["time"],
         attributes={
-            "units":    TIME_UNITS,
+            "units": TIME_UNITS,
             "calendar": TIME_CALENDAR,
             "long_name": "observation date",
         },
     )
     root.require_array(
         "orbit",
-        shape=(2,), chunks=(2,), dtype=str,
+        shape=(2,),
+        chunks=(2,),
+        dtype=str,
         dimension_names=["orbit"],
         attributes={"long_name": "orbit direction"},
     )
@@ -170,7 +161,9 @@ def create_store(store_dir: Path, overwrite: bool = False) -> icechunk.Repositor
 
     root.require_array(
         "band",
-        shape=(2,), chunks=(2,), dtype=str,
+        shape=(2,),
+        chunks=(2,),
+        dtype=str,
         dimension_names=["band"],
         attributes={"long_name": "band name"},
     )
@@ -178,7 +171,9 @@ def create_store(store_dir: Path, overwrite: bool = False) -> icechunk.Repositor
 
     root.require_array(
         "lat",
-        shape=(NLAT,), chunks=(NLAT,), dtype="float32",
+        shape=(NLAT,),
+        chunks=(NLAT,),
+        dtype="float32",
         dimension_names=["lat"],
         attributes={"units": "degrees_north", "long_name": "latitude"},
     )
@@ -186,7 +181,9 @@ def create_store(store_dir: Path, overwrite: bool = False) -> icechunk.Repositor
 
     root.require_array(
         "lon",
-        shape=(NLON,), chunks=(NLON,), dtype="float32",
+        shape=(NLON,),
+        chunks=(NLON,),
+        dtype="float32",
         dimension_names=["lon"],
         attributes={"units": "degrees_east", "long_name": "longitude"},
     )
@@ -205,17 +202,16 @@ def create_store(store_dir: Path, overwrite: bool = False) -> icechunk.Repositor
         compressors=[Zlib(level=9)],
         dimension_names=["time", "orbit", "lat", "lon", "band"],
         attributes={
-            "long_name":    "geophysical data (band 0 = snow depth, band 1 = quality flag)",
-            "units":        "cm",
+            "long_name": "geophysical data (band 0 = snow depth, band 1 = quality flag)",
+            "units": "cm",
             "scale_factor": SCALE_FACTOR,
-            "_FillValue":   int(FILL_MISSING),
+            "_FillValue": int(FILL_MISSING),
             "missing_value": int(FILL_NOOBS),
         },
     )
 
-    session.commit("Initialise empty store")
-    log.info(f"Created store at {store_dir}")
-    return repo
+    session.commit(commit_msg)
+    log.info("Initialized empty store")
 
 
 def open_repo() -> icechunk.Repository:
@@ -233,7 +229,7 @@ def stored_days(repo: icechunk.Repository) -> list[int]:
     return list(root["time"][:].tolist()) if n > 0 else []
 
 
-def insert_date(date: pd.Timestamp) -> None:
+def insert_date(date: pd.Timestamp, repo: icechunk.Repository) -> None:
     """
     Insert *date* (YYYYMMDD) into the IceChunk store.
 
@@ -246,7 +242,6 @@ def insert_date(date: pd.Timestamp) -> None:
     day_val  = int((date - TIME_EPOCH).days)
     date_iso = date.strftime("%Y-%m-%d")
 
-    repo    = open_repo()
     current = stored_days(repo)
 
     if day_val in current:
@@ -294,36 +289,51 @@ def insert_date(date: pd.Timestamp) -> None:
 
 ################################################################################
 
+# Initialize icechunk store
+jaxa_gportal_url = "https://gportal.jaxa.jp/"
 
-repo = create_store(STORE_DIR, overwrite=True)
+try:
+    repo = icechunk.Repository.open(
+        icechunk.s3_storage(
+            bucket="airborne-smce-prod-user-bucket",
+            prefix="JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND"
+        ),
+        authorize_virtual_chunk_access={jaxa_gportal_url: None}
+    )
+    session = repo.writable_session("main")
+    log.info("Found existing icechunk store")
+except icechunk.IcechunkError as e:
+    log.warning(
+        f"Failed to open existing repo with error: {str(e)}. "
+        "Trying to create a fresh repo."
+    )
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(jaxa_gportal_url, icechunk.http_store())
+    )
+    repo = icechunk.Repository.create(
+        icechunk.s3_storage(
+            bucket="airborne-smce-prod-user-bucket",
+            prefix="JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND"
+        ),
+        config=config,
+        authorize_virtual_chunk_access={jaxa_gportal_url: None}
+    )
+    session = repo.writable_session("main")
+    initialize_store(session)
 
 date_seq = pd.date_range(start="2018-09-01", end="2019-07-01", freq="D")
 
-for date in date_seq:
-    insert_date(date)
+for date in tqdm(date_seq):
+    insert_date(date, repo)
 
 ################################################################################
 
-fname = "GW1AM2_20260507_01D_EQMA_L3SGSNDHG2210210.h5"
-https_url = (
-    "https://gportal.jaxa.jp/download/standard/GCOM-W/GCOM-W.AMSR2"
-    f"/L3.SND_10/2/2026/05/{fname}"
-)
-
-local_store = Path("/tmp") / "amsr2-store-01"
-
-make_icechunk_repo(
-    str(local_store),
-    https_url,
-    None,
-    vc_prefix=f"https://gportal.jaxa.jp/",
-    vc_store_config=icechunk.http_store()
-)
-
-store = icechunk.local_filesystem_storage(local_store)
-repo = icechunk.Repository.open(store, authorize_virtual_chunk_access={"https://gportal.jaxa.jp/": None})
+log.info("Testing reading a subset of data")
+# Try reading the data
 session = repo.readonly_session("main")
-ds = xr.open_zarr(session.store, consolidated=False, zarr_format=3)
+ds = xr.open_zarr(session.store)
 
-ak = ds["Geophysical_Data"].isel(lat=slice(180, 360), lon=slice(1880, 2300))
-ak.mean().values
+sub = ds.sel(lat=52.07, lon=-91.99, method="nearest").sel(
+    orbit="Descending", band="snow_depth", time=slice("2018-10-01", "2019-02-01"))
+print(sub["geophysical_data"].values)
