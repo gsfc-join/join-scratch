@@ -243,22 +243,31 @@ except ValueError as e:
 # Create result dataset
 time_values = pd.date_range(start="2019-01-01", end="2019-01-08", freq="D")
 
-reference = lis["TBOT"]
+result = (lis[["lat", "lon", "lat_b", "lon_b"]]
+          .copy()
+          .set_coords(["lon", "lat", "lon_b", "lat_b"]))
+
+reference = result["lat"]
 dst_shape = reference.shape
 regridded_slices = []
 
 # NOTE: This can be naively parallelized
+log.info("Regridding time steps")
 for t in tqdm(time_values):
     dat = (amsr2_ds["geophysical_data"].sel(time=t, method="nearest")
-           .sel(orbit="Descending", band="snow_depth")).values
-    regridded = regrid_slice(dat, W, dst_shape)
-    da_slice = xr.full_like(reference, fill_value=np.nan)
-    da_slice.values = regridded
+           .sel(orbit="Descending", band="snow_depth"))
+    regridded = regrid_slice(dat.values, W, dst_shape)
+    reference.coords
+    da_slice = xr.DataArray(
+        data=regridded,
+        coords=reference.coords,
+        dims=reference.dims,
+        attrs=dat.attrs
+    )
     regridded_slices.append(da_slice)
 
-result_da = xr.concat(regridded_slices, dim=pd.Index(time_values, name="time"))
+result["snow_depth_amsr2"] = xr.concat(regridded_slices, dim=pd.Index(time_values, name="time"))
 
-result = result_da.to_dataset(name = "snow_depth_amsr2")
 s3_tmp = f"s3://{bucket_name}/JOIN/outputs-preliminary"
-result.to_zarr(f"{s3_tmp}/amsr2-regridded.zarr")
-
+log.info("Writing result to %s", s3_tmp)
+result.to_zarr(f"{s3_tmp}/amsr2-regridded.zarr", mode="w")
