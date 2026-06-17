@@ -96,6 +96,8 @@ spherely = ">=0.1.0,<0.2"
 pys2index = ">=0.1.5,<0.2"
 xoak = ">=0.2.0,<0.3"
 boto3 = ">=1.43.0,<2"
+jupytext = ">=1.19.3,<2"
+nco = ">=5.3.9,<6"
 
 [tool.pixi.feature.dev.dependencies]
 ipython = "*"
