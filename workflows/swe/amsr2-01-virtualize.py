@@ -214,13 +214,6 @@ def initialize_store(session: icechunk.Session, commit_msg: str = "Initialize em
     log.info("Initialized empty store")
 
 
-def open_repo() -> icechunk.Repository:
-    return icechunk.Repository.open(
-        icechunk.local_filesystem_storage(str(STORE_DIR)),
-        authorize_virtual_chunk_access={"https://gportal.jaxa.jp/": None},
-    )
-
-
 def stored_days(repo: icechunk.Repository) -> list[int]:
     """Return the list of int32 day values currently in the store (insertion order)."""
     session = repo.readonly_session("main")
