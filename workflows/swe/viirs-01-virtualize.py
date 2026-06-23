@@ -88,8 +88,6 @@ for i in tqdm(range(0, hmax)):
     xcoords = tvds["XDim"].values
     x_coord_list.append(xcoords)
 
-x_coord_array = np.concat(x_coord_list)
-
 # Get all unique Y coordinates from vertical tiles
 y_coord_list = []
 for i in tqdm(range(0, vmax)):
@@ -98,106 +96,66 @@ for i in tqdm(range(0, vmax)):
     ycoords = tvds["YDim"].values
     y_coord_list.append(ycoords)
 
-y_coord_array = np.concat(y_coord_list)
+def virtualize_viirs_date(date_dat: pd.DataFrame, empty_marr: ManifestArray):
+    vds_hlist = []
+    for h in tqdm(range(0, hmax), "horizontal"):
+        vds_vlist = []
+        for v in tqdm(range(0, vmax), desc="vertical", leave=False):
+            # Look for a VIIRS granule.
+            hvdat = date_dat.query("horizontal_tile == @h and vertical_tile == @v")
+            if hvdat.empty:
+                # print(f"h{h} v{v} - empty")
+                item = xr.DataArray(
+                    empty_marr,
+                    dims=reference.dims,
+                    coords={
+                        "XDim": x_coord_list[h],
+                        "YDim": y_coord_list[v]
+                    },
+                    attrs=reference.attrs,
+                    name=reference.name
+                ).to_dataset()
+            else:
+                # print(f"h{h} v{v} - got item")
+                item = open_viirs_vds(hvdat["url"].iloc[0])[["CGF_NDSI_Snow_Cover"]]
+            vds_vlist.append(item.copy())
+        vds_hlist.append(vds_vlist.copy())
+    viirs_complete = xr.concat((xr.concat(vl, "YDim") for vl in vds_hlist), "XDim")
+    return viirs_complete.copy()
 
-# Construct a complete global empty xarray dataset from all possible VIIRS grid 
-# coordinates
-# viirs_sine_ds = xr.Dataset(coords={
-#     "XDim": x_coord_array,
-#     "YDim": y_coord_array
-# })
-# shp = (viirs_sine_ds.sizes["YDim"], viirs_sine_ds.sizes["XDim"])
-# empty = da.full(shp, np.nan, chunks = (1000, 1000))
+# Variable that we are targeting
 reference = tvds["CGF_NDSI_Snow_Cover"]
+
+# Empty ManifestArray that we will use as a template for situations where VIIRS 
+# data are not available.
 empty_marr = reference.variable.data.with_fill_value_only(reference.attrs["_FillValue"])
 
 # Now, construct a complete empty VIIRS grid for all tiles
-empty_vds_hlist = []
-for h in range(0, hmax):
-    empty_vds_vlist = []
-    for v in range(0, vmax):
-        empty_da = xr.DataArray(
-                empty_marr,
-                dims=reference.dims,
-                coords={
-                    "XDim": x_coord_list[h],
-                    "YDim": y_coord_list[v]
-                },
-                attrs=reference.attrs,
-                name=reference.name
-        )
-        empty_vds_vlist.append(empty_da.copy())
-    empty_vds_hlist.append(empty_vds_vlist.copy())
+src_url_df = src_url_df.set_index("date")
 
-viirs_sine_da = xr.concat((xr.concat(vl, "YDim") for vl in empty_vds_hlist), "XDim")
-viirs_sine_ds = viirs_sine_da.to_dataset(name="CGF_NDSI_Snow_Cover")
+dates = pd.date_range("2019-01-01", "2019-01-07", freq="D")
+dates = dates[0:2]
 
-# Open one VIIRS granule 
-vds1 = open_viirs_vds(src_url_df["url"].iloc[0])
+# vds1 = virtualize_viirs_date(src_url_df.loc['2019-01-01'], empty_marr)
+# vds2 = virtualize_viirs_date(src_url_df.loc[pd.to_datetime("2019-01-02")], empty_marr)
 
-viirs_sine_ds["CGF_NDSI_Snow_Cover"].loc[{
-    "XDim": vds1["XDim"],
-    "YDim": vds1["YDim"]
-}] = vds1["CGF_NDSI_Snow_Cover"]
+vds_complete = xr.concat((
+    virtualize_viirs_date(src_url_df.loc[d], empty_marr) for d in tqdm(dates, desc="Dates")
+), dim=pd.Index(dates, name="time"))
 
-# Get all the X coordinates at the equator (vertical tile)
-meridian_tiles = src_url_df.query("horizontal_tile == 18 and doy == 1")
-meridian_vds = [open_viirs_vds(url) for url in meridian_tiles["url"]]
+# Create icechunk store
+vds12.vz.to_kerchunk(Path("~/viirs.json").expanduser(), format = "json")
 
-equator_tiles = src_url_df.query("vertical_tile == 18 and doy == 1")
+# Try reading 
+vds_test = xr.open_dataset("~/viirs.json", engine="kerchunk")
 
-# For now, just virtualize
+import cartopy.crs as ccrs
+modis_
 
-left = open_viirs_vds(src_url_df.query("horizontal_tile==0")["url"].iloc[0])
-right = open_viirs_vds(src_url_df.query("horizontal_tile==35")["url"].iloc[-1])
-top = open_viirs_vds(src_url_df.query("vertical_tile==0")["url"].iloc[0])
-bot = open_viirs_vds(src_url_df.query("vertical_tile==17")["url"].iloc[-1])
+fig, ax = plt.subplots()
+vds_test["CGF_NDSI_Snow_Cover"].sel(time="2019-01-01").plot(x="XDim", y="YDim", ax=ax)
+fig.savefig("~/viirs_map_jan1.png", bbox_inches="tight", dpi=300)
 
-left["XDim"].min()
-right["XDim"].max()
-
-src_url_df.max()
-bot = open_viirs_vds()
-bot = open_viirs_vds(str(src_url_df
-                      .query("horizontal_tile == 35")
-                      .query("vertical_tile == 10")
-                      .query("doy == 1")["url"].iloc[0]))
-
-vds1["Daily_NDSI_Snow_Cover"]
-
-src_urls[0]
-src_urls[1]
-vds1 = open_viirs_vds(src_url_df.loc[0, :]["url"])
-vds2 = open_viirs_vds(src_url_df.loc[1, :]["url"])
-vds3 = open_viirs_vds(src_url_df.loc[2, :]["url"])
-
-vds0 = open_viirs_vds(src_url_df.loc[0, "url"])
-vdslast = open_viirs_vds(src_url_df.loc[])
-
-vds_list = [open_viirs_vds(url) for url in src_url_df.loc[0:10, "url"]]
-vds_combined = xr.combine_by_coords(vds_list[0:6])
-
-df_sub = src_url_df[src_url_df["doy"] == 1][src_url_df["horizontal_tile"] < 3]
-
-h0 = df_sub.loc[df_sub["horizontal_tile"] == 0]["url"]
-vds_h0 = xr.concat([open_viirs_vds(url) for url in h0], "YDim")
-h1 = df_sub.loc[df_sub["horizontal_tile"] == 1]["url"]
-vds_h1 = xr.concat([open_viirs_vds(url) for url in h1], "YDim")
-
-vds_h01 = xr.concat([vds_h0, vds_h1], "XDim")
-
-vds4 = open_viirs_vds(src_url_df.loc[4, :]["url"])
-
-vds
-
-vds123 = xr.concat([vds1, vds2, vds3], "YDim")
-
-df1 = src_url_df.loc[0:2, :]
-df1["xds"] = df1["url"].apply(open_viirs_vds)
-df1
-
-src_url_df["xds"] = src_url_df
-
-vds12 = xr.concat([vds1, vds2])
-
-# vds_all = open_virtual_mfdataset(src_urls, parser=parser, registry=registry)
+fig, ax = plt.subplots()
+vds_test["CGF_NDSI_Snow_Cover"].sel(time="2019-01-02").plot(x="XDim", y="YDim", ax=ax)
+fig.savefig("~/viirs_map_jan2.png", bbox_inches="tight", dpi=300)
