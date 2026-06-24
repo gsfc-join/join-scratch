@@ -1,5 +1,10 @@
 #!/usr/bin/env python
 
+# NOTE: The resulting virtualized VIIRS dataset is in ascending order in the X 
+# dimension (left --> right), but in **descending** order in the Y dimension 
+# (from top --> bottom). Therefore, when slicing, unless you re-sort the 
+# coordinates, you have to do `slice(ymax, ymin)` to return data.
+
 from pathlib import Path
 import os
 import re
@@ -32,6 +37,10 @@ src_bucket_url = f"s3://{bucket}"
 dst_bucket_url = f"s3://{bucket}"
 
 src_prefix_path = "JOIN/VIIRS/VJ110A1F"
+
+# MODIS sinusoidal grid dimensions - h36 x v18
+hmax = 36
+vmax = 18
 
 src_store = obstore.store.S3Store(bucket=bucket, config=s3_store_config())
 registry = ObjectStoreRegistry({src_bucket_url: src_store})
@@ -75,10 +84,6 @@ def open_viirs_vds(src_url):
     vds_coords = open_virtual_dataset(src_url, registry, HDFParser(group=VIIRS_HDF_ROOT))
     vds = xr.merge([vds_data, vds_coords])
     return vds.copy()
-
-# Create an Xarray dataset of the entire
-hmax = 35
-vmax = 17
 
 # Get all unique X coordinates from horizontal tiles
 x_coord_list = []
@@ -144,18 +149,30 @@ vds_complete = xr.concat((
 ), dim=pd.Index(dates, name="time"))
 
 # Create icechunk store
-vds12.vz.to_kerchunk(Path("~/viirs.json").expanduser(), format = "json")
+vds_complete.vz.to_kerchunk(Path("~/viirs.json").expanduser(), format = "json")
 
 # Try reading 
 vds_test = xr.open_dataset("~/viirs.json", engine="kerchunk")
 
 import cartopy.crs as ccrs
-modis_
+modis_ccrs = ccrs.Sinusoidal()
+
+# Test region around Minneapolis
+# xmin, ymin, xmax, ymax
+test_bbox = [-95.6326, 43.5113, -85.4592, 48.1318]
+test_bbox_modis = modis_ccrs.transform_points(
+    ccrs.PlateCarree(),
+    np.array(test_bbox[0:4:2]),
+    np.array(test_bbox[1:4:2])
+)
+
+# NOTE: Slice from **top to bottom** in the Y dimension (`slice(ymax, ymin)`) 
+# because the Y coordinate is stored in descending order.
+vds_test_sub = vds_test.sel(
+    XDim = slice(test_bbox_modis[0,0], test_bbox_modis[1,0]),
+    YDim = slice(test_bbox_modis[1,1], test_bbox_modis[0,1])
+)
 
 fig, ax = plt.subplots()
-vds_test["CGF_NDSI_Snow_Cover"].sel(time="2019-01-01").plot(x="XDim", y="YDim", ax=ax)
-fig.savefig("~/viirs_map_jan1.png", bbox_inches="tight", dpi=300)
-
-fig, ax = plt.subplots()
-vds_test["CGF_NDSI_Snow_Cover"].sel(time="2019-01-02").plot(x="XDim", y="YDim", ax=ax)
-fig.savefig("~/viirs_map_jan2.png", bbox_inches="tight", dpi=300)
+vds_test_sub["CGF_NDSI_Snow_Cover"].sel(time="2019-01-01").plot(x="XDim", y="YDim", ax=ax)
+fig.savefig(Path("~/viirs_map_jan1.png").expanduser(), bbox_inches="tight", dpi=300)
