@@ -5,7 +5,6 @@
 # (from top --> bottom). Therefore, when slicing, unless you re-sort the 
 # coordinates, you have to do `slice(ymax, ymin)` to return data.
 
-from pathlib import Path
 import os
 import re
 
@@ -17,7 +16,7 @@ from join_scratch.utils.s3 import s3_store_config, list_s3
 import obstore
 from obspec_utils.registry import ObjectStoreRegistry
 
-from virtualizarr import open_virtual_dataset, open_virtual_mfdataset
+from virtualizarr import open_virtual_dataset
 from virtualizarr.parsers import HDFParser
 from virtualizarr.manifests import ManifestArray
 
@@ -26,21 +25,23 @@ import icechunk as ic
 from tqdm import tqdm
 import xarray as xr
 import pandas as pd
-import numpy as np
-import dask.array as da
-
-from matplotlib import pyplot as plt
 
 bucket = "airborne-smce-prod-user-bucket"
 region = "us-west-2"
-src_bucket_url = f"s3://{bucket}"
-dst_bucket_url = f"s3://{bucket}"
 
+src_bucket_url = f"s3://{bucket}"
 src_prefix_path = "JOIN/VIIRS/VJ110A1F"
+src_prefix_url = f"{src_bucket_url}/{src_prefix_path}/"
+
+dst_bucket_url = f"s3://{bucket}"
+dst_prefix = "JOIN/icechunk-stores/VIIRS/VJ110A1F"
 
 # MODIS sinusoidal grid dimensions - h36 x v18
 hmax = 36
 vmax = 18
+
+# Virtualize 1 week of data (which is what we have). Extend this as needed.
+dates = pd.date_range("2019-01-01", "2019-01-07", freq="D")
 
 src_store = obstore.store.S3Store(bucket=bucket, config=s3_store_config())
 registry = ObjectStoreRegistry({src_bucket_url: src_store})
@@ -68,11 +69,14 @@ for url in src_urls:
     })
 src_url_df = pd.DataFrame(parsed_urls)
 
-# Build virtual zarr store of all the VIIRS data
+def open_viirs_vds(src_url: str, registry: ObjectStoreRegistry) -> xr.Dataset:
+    """
+    Open a single VIIRS granule as a virtual dataset. 
 
-# Try opening one VIIRS file
-def open_viirs_vds(src_url):
-    # src_url = src_urls[0]
+    Args:
+        src_url (str): S3 URL to a VIIRS granule
+        registry (obspec.utils.ObjectStoreRegistry)
+    """
     VIIRS_HDF_ROOT = "HDFEOS/GRIDS/VIIRS_Grid_IMG_2D"
     dim_rename = {
             f"{VIIRS_HDF_ROOT}/YDim": "YDim",
@@ -89,7 +93,7 @@ def open_viirs_vds(src_url):
 x_coord_list = []
 for i in tqdm(range(0, hmax)):
     url = src_url_df.query(f"horizontal_tile == {i}")["url"].iloc[0]
-    tvds = open_viirs_vds(url)
+    tvds = open_viirs_vds(url, registry)
     xcoords = tvds["XDim"].values
     x_coord_list.append(xcoords)
 
@@ -97,11 +101,14 @@ for i in tqdm(range(0, hmax)):
 y_coord_list = []
 for i in tqdm(range(0, vmax)):
     url = src_url_df.query(f"vertical_tile == {i}")["url"].iloc[0]
-    tvds = open_viirs_vds(url)
+    tvds = open_viirs_vds(url, registry)
     ycoords = tvds["YDim"].values
     y_coord_list.append(ycoords)
 
 def virtualize_viirs_date(date_dat: pd.DataFrame, empty_marr: ManifestArray):
+    # Refresh the credentials here to avoid credential timeouts
+    src_store_local = obstore.store.S3Store(bucket=bucket, config=s3_store_config())
+    registry_local = ObjectStoreRegistry({src_bucket_url: src_store_local})
     vds_hlist = []
     for h in tqdm(range(0, hmax), "horizontal"):
         vds_vlist = []
@@ -109,7 +116,6 @@ def virtualize_viirs_date(date_dat: pd.DataFrame, empty_marr: ManifestArray):
             # Look for a VIIRS granule.
             hvdat = date_dat.query("horizontal_tile == @h and vertical_tile == @v")
             if hvdat.empty:
-                # print(f"h{h} v{v} - empty")
                 item = xr.DataArray(
                     empty_marr,
                     dims=reference.dims,
@@ -121,8 +127,7 @@ def virtualize_viirs_date(date_dat: pd.DataFrame, empty_marr: ManifestArray):
                     name=reference.name
                 ).to_dataset()
             else:
-                # print(f"h{h} v{v} - got item")
-                item = open_viirs_vds(hvdat["url"].iloc[0])[["CGF_NDSI_Snow_Cover"]]
+                item = open_viirs_vds(hvdat["url"].iloc[0], registry_local)[["CGF_NDSI_Snow_Cover"]]
             vds_vlist.append(item.copy())
         vds_hlist.append(vds_vlist.copy())
     viirs_complete = xr.concat((xr.concat(vl, "YDim") for vl in vds_hlist), "XDim")
@@ -138,41 +143,32 @@ empty_marr = reference.variable.data.with_fill_value_only(reference.attrs["_Fill
 # Now, construct a complete empty VIIRS grid for all tiles
 src_url_df = src_url_df.set_index("date")
 
-dates = pd.date_range("2019-01-01", "2019-01-07", freq="D")
-dates = dates[0:2]
-
-# vds1 = virtualize_viirs_date(src_url_df.loc['2019-01-01'], empty_marr)
-# vds2 = virtualize_viirs_date(src_url_df.loc[pd.to_datetime("2019-01-02")], empty_marr)
-
 vds_complete = xr.concat((
     virtualize_viirs_date(src_url_df.loc[d], empty_marr) for d in tqdm(dates, desc="Dates")
 ), dim=pd.Index(dates, name="time"))
 
-# Create icechunk store
-vds_complete.vz.to_kerchunk(Path("~/viirs.json").expanduser(), format = "json")
-
-# Try reading 
-vds_test = xr.open_dataset("~/viirs.json", engine="kerchunk")
-
-import cartopy.crs as ccrs
-modis_ccrs = ccrs.Sinusoidal()
-
-# Test region around Minneapolis
-# xmin, ymin, xmax, ymax
-test_bbox = [-95.6326, 43.5113, -85.4592, 48.1318]
-test_bbox_modis = modis_ccrs.transform_points(
-    ccrs.PlateCarree(),
-    np.array(test_bbox[0:4:2]),
-    np.array(test_bbox[1:4:2])
+################################################################################
+# Save to icechunk
+dst_store = ic.s3_storage(
+    bucket=bucket,
+    prefix=dst_prefix,
+    region=region,
+    from_env=True
+)
+config = ic.RepositoryConfig.default()
+config.set_virtual_chunk_container(ic.VirtualChunkContainer(
+    src_prefix_url,
+    ic.storage.s3_store(region="us-west-2"),
+    name = "viirs-snow-s3"
+))
+credentials = ic.credentials.containers_credentials(
+    {src_prefix_url: ic.credentials.s3_credentials(from_env=True)}
 )
 
-# NOTE: Slice from **top to bottom** in the Y dimension (`slice(ymax, ymin)`) 
-# because the Y coordinate is stored in descending order.
-vds_test_sub = vds_test.sel(
-    XDim = slice(test_bbox_modis[0,0], test_bbox_modis[1,0]),
-    YDim = slice(test_bbox_modis[1,1], test_bbox_modis[0,1])
-)
+repo = ic.Repository.open_or_create(dst_store, config, credentials)
+repo.save_config()
 
-fig, ax = plt.subplots()
-vds_test_sub["CGF_NDSI_Snow_Cover"].sel(time="2019-01-01").plot(x="XDim", y="YDim", ax=ax)
-fig.savefig(Path("~/viirs_map_jan1.png").expanduser(), bbox_inches="tight", dpi=300)
+session = repo.writable_session("main")
+vds_complete.vz.to_icechunk(session.store)
+commit_id = session.commit("Virtualize raw VIIRS VJ110A1F data")
+print(f"Committed: {commit_id}")
