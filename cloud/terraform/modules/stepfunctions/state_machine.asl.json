@@ -1,0 +1,238 @@
+{
+  "Comment": "AMSR2 IceChunk population + ESMF weight generation pipeline. Consumers receive the populated IceChunk store URI and the cached weights URI to apply regridding themselves.",
+  "StartAt": "EnumerateDates",
+  "States": {
+
+    "EnumerateDates": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${enumerate_dates_arn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$.enumerated",
+      "OutputPath": "$.enumerated.body",
+      "Comment": "Expands start_date/end_date into a dates array for the Map fan-out.",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ParallelPrep"
+    },
+
+    "ParallelPrep": {
+      "Type": "Parallel",
+      "Comment": "Run IceChunk population and weight generation concurrently — neither depends on the other.",
+      "Branches": [
+
+        {
+          "Comment": "Branch 1: IceChunk store init (Lambda) then fan-out populate per date.",
+          "StartAt": "InitStore",
+          "States": {
+            "InitStore": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${init_store_arn}",
+                "Payload": {
+                  "source.$":         "$.source",
+                  "store_uri.$":      "$.store_uri",
+                  "recreate_store.$": "$.recreate_store"
+                }
+              },
+              "ResultSelector": {
+                "store_initialized.$": "$.Payload.store_initialized"
+              },
+              "ResultPath": "$.init_store_result",
+              "Comment": "Idempotent: creates the IceChunk store if it does not already exist.",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "PopulateRefs"
+            },
+
+            "PopulateRefs": {
+              "Type": "Map",
+              "Comment": "Fan-out: one Batch job per date. MaxConcurrency=10 to avoid G-Portal rate limits.",
+              "ItemsPath": "$.dates",
+              "ItemSelector": {
+                "source.$":         "$.source",
+                "store_uri.$":      "$.store_uri",
+                "date.$":           "$$.Map.Item.Value",
+                "force_repopulate.$": "States.Format('{}', $.force_repopulate)"
+              },
+              "MaxConcurrency": 10,
+              "Iterator": {
+                "StartAt": "PopulateDate",
+                "States": {
+                  "PopulateDate": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::batch:submitJob.sync",
+                    "Parameters": {
+                      "JobName.$": "States.Format('icechunk-populate-{}', $.date)",
+                      "JobQueue": "${batch_job_queue_arn}",
+                      "JobDefinition": "${icechunk_populate_job_definition_arn}",
+                      "ContainerOverrides": {
+                        "Environment": [
+                          {"Name": "SOURCE",           "Value.$": "$.source"},
+                          {"Name": "STORE_URI",         "Value.$": "$.store_uri"},
+                          {"Name": "DATE",              "Value.$": "$.date"},
+                          {"Name": "FORCE_REPOPULATE",  "Value.$": "$.force_repopulate"}
+                        ]
+                      }
+                    },
+                    "ResultPath": null,
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Batch.BatchException", "States.TaskFailed"],
+                        "IntervalSeconds": 15,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2.0
+                      }
+                    ],
+                    "End": true
+                  }
+                }
+              },
+              "ResultPath": null,
+              "End": true
+            }
+          }
+        },
+
+        {
+          "Comment": "Branch 2: Check weights cache, generate if missing.",
+          "StartAt": "CheckWeightsCache",
+          "States": {
+            "CheckWeightsCache": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${check_weights_arn}",
+                "Payload.$": "$"
+              },
+              "ResultSelector": {
+                "body.$": "$.Payload"
+              },
+              "ResultPath": "$.cache_check",
+              "OutputPath": "$.cache_check.body",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "WeightsCacheChoice"
+            },
+
+            "WeightsCacheChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.weights_exist",
+                  "BooleanEquals": true,
+                  "Next": "WeightsReady"
+                }
+              ],
+              "Default": "GenerateWeights"
+            },
+
+            "WeightsReady": {
+              "Type": "Pass",
+              "Comment": "Weights already cached on S3 — nothing to do.",
+              "End": true
+            },
+
+            "GenerateWeights": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::batch:submitJob.sync",
+              "Parameters": {
+                "JobName": "esmf-generate-weights",
+                "JobQueue": "${batch_job_queue_arn}",
+                "JobDefinition": "${regrid_job_definition_arn}",
+                "ContainerOverrides": {
+                  "Environment": [
+                    {"Name": "SOURCE",           "Value.$": "$.source"},
+                    {"Name": "WEIGHTS_URI",       "Value.$": "$.weights_uri"},
+                    {"Name": "DST_GRID",          "Value.$": "$.dst_grid"},
+                    {"Name": "METHOD",            "Value.$": "$.method"},
+                    {"Name": "FORCE_REGENERATE",  "Value.$": "States.Format('{}', $.force_regenerate)"},
+                    {"Name": "EXTRA_ARGS",        "Value": "--no_log --ignore_unmapped"}
+                  ]
+                }
+              },
+              "ResultPath": null,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Batch.BatchException", "States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+
+      ],
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "ApplyRegrid"
+    },
+
+    "ApplyRegrid": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "TODO: Service 4 — apply weights and write regridded output. Currently returns a placeholder response.",
+      "Parameters": {
+        "FunctionName": "${apply_regrid_arn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "body.$": "$.Payload"
+      },
+      "ResultPath": "$.apply_regrid_result",
+      "Next": "PipelineComplete"
+    },
+
+    "PipelineComplete": {
+      "Type": "Succeed",
+      "Comment": "IceChunk store is populated and weights are cached. Consumers can now open store_uri and weights_uri directly."
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "One or more pipeline stages failed. Check CloudWatch Logs for details."
+    }
+
+  }
+}
