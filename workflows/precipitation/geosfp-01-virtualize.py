@@ -43,7 +43,9 @@ log = logging.getLogger(__name__)
 # Access: HTTPS (no authentication required)
 # Notes: 
 # - the data chunking changes at some point between 2019 and 2026
-# - currently takes about 45 seconds to virtualize a days worth of files (24 files)
+# - currently takes about 45 seconds to virtualize a days worth of files (24 files); 30 minutes for entire project period.
+# - data requested is T2M and TPW (total precipitable water - called TQV in their documentation)
+# - review this dcoumentation for automating: https://github.com/virtual-zarr/geos-cf-icechunk
 
 # Constants      
 
@@ -57,7 +59,7 @@ FNAME_TMPL   = "GEOS.fp.asm.tavg1_2d_slv_Nx.{date}_{time}.V01.nc4"
 geosfp_url = "https://portal.nccs.nasa.gov/"
 bucket="airborne-smce-prod-user-bucket"
 region="us-west-2"
-dst_prefix="JOIN/icechunk-stores/GEOS-FP-T2M"
+dst_prefix="JOIN/icechunk-stores/GEOS-FP"
 
 # Helpers
 
@@ -81,8 +83,10 @@ def geos_url(date: pd.Timestamp) -> str:
 
 # 1. Generate URLs
 
-date_seq = pd.date_range(start="2019-06-01 00:30", end="2019-06-01 23:30", freq="h") 
+date_seq = pd.date_range(start="2026-01-24 00:30", end="2026-02-19 23:30", freq="h") 
 # For time averaged data ('tavg') must start and end on half hour
+
+geos_urls = [geos_url(date) for date in date_seq]
 
 log.info(f"Opening {len(geos_urls)} files virtually...")
 
@@ -94,8 +98,8 @@ vds_all = open_virtual_mfdataset(geos_urls, parser=parser, registry=registry)
 
 print(vds_all)
 
-# If you only want T2M, you can drop other variables to keep the manifest small (to do: test how this scales to all variables)
-vds_t2m = vds_all[["T2M"]]
+# If you only want T2M (or another variable), you can drop other variables to keep the manifest small
+#vds_t2m = vds_all[["T2M"]]
 
 # 2. Create IceChunk repo and virtualize data.
 # If it already exists, currently need to delete and re-create.
@@ -123,10 +127,10 @@ repo.save_config()
 
 session = repo.writable_session("main")
 
-#vds_all.vz.to_icechunk(session.store)
-vds_t2m.vz.to_icechunk(session.store)
+vds_all.vz.to_icechunk(session.store)
+#vds_t2m.vz.to_icechunk(session.store)
 
-commit_id = session.commit(f"Virtualized GEOS-FP T2M data for {date_seq[0]} to {date_seq[-1]}")
+commit_id = session.commit(f"Virtualized GEOS-FP data for {date_seq[0]} to {date_seq[-1]}")
 print(f"Committed: {commit_id}")
 
 ################################################################################
@@ -139,8 +143,9 @@ session = repo.readonly_session("main")
 ds = xr.open_zarr(session.store)
 
 sub = ds.sel(lat=52.07, lon=-91.99, method="nearest").sel(
-    time=slice("2019-06-01", "2019-06-01"))
+    time=slice("2026-02-01", "2026-02-01"))
 print(sub["T2M"].values)
+print(sub["TQV"].values)
 
 fig, ax = plt.subplots()
 ds["T2M"].sel(time="2019-06-01 01:30").plot(x="lon", y="lat", ax=ax)
@@ -148,4 +153,12 @@ fig.savefig(Path("~/2m_airtemp_map.png").expanduser(), bbox_inches="tight", dpi=
 
 fig, ax = plt.subplots()
 ds["T2M"].sel(lat=52.07, lon=-91.99, method="nearest").plot(x="time", ax=ax)
+fig.savefig(Path("~/timeseries.png").expanduser(), bbox_inches="tight", dpi=300)
+
+fig, ax = plt.subplots()
+ds["TQV"].sel(time="2019-06-01 01:30").plot(x="lon", y="lat", ax=ax)
+fig.savefig(Path("~/2m_airtemp_map.png").expanduser(), bbox_inches="tight", dpi=300)
+
+fig, ax = plt.subplots()
+ds["TQV"].sel(lat=52.07, lon=-91.99, method="nearest").plot(x="time", ax=ax)
 fig.savefig(Path("~/timeseries.png").expanduser(), bbox_inches="tight", dpi=300)
