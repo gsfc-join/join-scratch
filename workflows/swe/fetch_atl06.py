@@ -141,6 +141,8 @@ def main() -> None:
         "t1": ns.t1,
     }
 
+    print(parms)
+    
     ns.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     results: list[BenchmarkResult] = []
@@ -156,6 +158,7 @@ def main() -> None:
     cache_path = ns.cache_path
 
     gdf: gpd.GeoDataFrame = _sliderule.run("atl06x", parms)
+    print(gdf)
     gdf.to_parquet(cache_path)
 
 if __name__ == "__main__":

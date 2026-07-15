@@ -10,10 +10,17 @@ log = logging.getLogger(__name__)
 # Default S3 region for the SMCE bucket
 _DEFAULT_REGION = "us-west-2"
 
-
 def _is_s3(path: str) -> bool:
     return str(path).startswith("s3://")
 
+def get_jupyterhub_s3_credentials():
+    import os
+    return {
+        "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID"),
+        "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        "token": os.environ.get("AWS_SESSION_TOKEN"),
+        "expires_at": datetime.now(UTC) + timedelta(minutes=60) # Auto-refreshes before expiry
+    }
 
 def make_store(bucket: str, prefix: str = "", region: str = _DEFAULT_REGION):
     """Create an obstore S3Store for a bucket/prefix.
@@ -36,22 +43,36 @@ def make_store(bucket: str, prefix: str = "", region: str = _DEFAULT_REGION):
     return S3Store(bucket, region=region, prefix=prefix)
 
 
-def make_fs(region: str = _DEFAULT_REGION):
-    """Return an obstore FsspecStore for use with xarray / h5py / satpy.
-
-    Parameters
-    ----------
-    region:
-        AWS region string.
-
-    Returns
-    -------
-    obstore.fsspec.FsspecStore
-    """
+def make_fs(region: str = "us-west-2"): # replace "us-east-1" with your _DEFAULT_REGION if needed
+    """Return an obstore FsspecStore for use with xarray / h5py / satpy."""
     from obstore.fsspec import FsspecStore
+    import boto3
+    import os
 
-    return FsspecStore("s3", region=region)
+    # 1. Hide empty environment variables from obstore's Rust backend
+    for bad_var in ["AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN"]:
+        if os.environ.get(bad_var) == "":
+            del os.environ[bad_var]
 
+    # 2. Use boto3 to grab your working credentials (handles profiles, SSO, ~/.aws, etc.)
+    session = boto3.Session(region_name=region)
+    creds = session.get_credentials()
+    
+    config = {"region": region}
+
+    # 3. If boto3 found credentials, extract the raw strings
+    if creds:
+        frozen = creds.get_frozen_credentials()
+        config["access_key_id"] = frozen.access_key
+        config["secret_access_key"] = frozen.secret_key
+        if frozen.token:
+            config["session_token"] = frozen.token
+
+    # 4. Filter out any empty values so obstore doesn't crash on 'None'
+    clean_config = {k: v for k, v in config.items() if v}
+
+    # 5. Initialize obstore with the working credentials
+    return FsspecStore("s3", **clean_config)
 
 def list_s3(store, prefix: str = "") -> list[str]:
     """List all object keys under *prefix* in *store*.

@@ -1,3 +1,7 @@
+workflows/swe/plot
+workflows/swe/_data
+
+
 # Quarto outputs
 docs/_site/
 docs/.quarto/
