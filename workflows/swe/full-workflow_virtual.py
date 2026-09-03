@@ -74,6 +74,12 @@ import os
 import boto3
 import time
 
+import icechunk as ic
+from icechunk import Repository, s3_storage
+import xcdat as xc
+
+import obstore
+
 # Use boto3 to grab the working credentials
 session = boto3.Session()
 creds = session.get_credentials()
@@ -96,6 +102,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
+    force=True
 )
 log = logging.getLogger(__name__)
 
@@ -132,7 +139,10 @@ def _ensure_local_dir(path: str) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-
+def list_s3(store, prefix):
+    # Dummy helper matching user's original logic or obstore listing
+    return [meta['path'] for meta in store.list(prefix=prefix)]
+    
 # ── helpers ───────────────────────────────────────────────────────────────────
 def _regrid_amsr2(
     input_dir: str,
@@ -143,50 +153,33 @@ def _regrid_amsr2(
     overwrite_weights: bool = False,
     fs=None,
 ) -> dict[str, xr.DataArray]:
-    """Regrid the first matching AMSR2 file found and return {var_name: DataArray}."""
-    
-    import matplotlib.pyplot as plt
-    import cartopy.crs as ccrs
-    import cartopy.feature as cfeature
-    from pathlib import Path
-    import xarray as xr
-    import numpy as np
+    """Regrid AMSR2 dataset using icechunk and return {var_name: DataArray}."""
 
-    # Format the date to match how it appears in your filenames
-    # Example format: "20190101"
-    date_str = current_date.strftime("%Y%m%d") 
-
-    all_files = _list_files(input_dir, ".h5", fs=fs)
-    # Filter for files that belong to this specific date
-    files = [f for f in all_files if "01D" in f and "EQMD" in f and date_str in f]
+    # 1. Initialize icechunk store
+    log.info("Initializing icechunk repository...")
+    jaxa_gportal_url = "https://gportal.jaxa.jp/"
     
-    if not files:
-        log.warning("No daily descending AMSR2 files found — skipping")
-        return {}
+    repo = Repository.open(
+        s3_storage(
+            bucket="airborne-smce-prod-user-bucket",
+            prefix="JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND"
+        ),
         
-    path = files[0]
-    log.info("AMSR2: using %s", _path_name(path))
+    )
 
-    if _is_s3(path):
-        handler = handler_from_s3(Amsr2FileHandler, path, fs=fs)
-    else:
-        handler = Amsr2FileHandler.from_path(path)
+    # 2. Open a read-only session for the main branch
+    session = repo.readonly_session("main")
 
-    # 1. Load dataset, rename dimensions
-    da = handler.get_dataset().rename({"y": "lat", "x": "lon"})
-    
-    # 2. Fix the 180-degree phase shift in the source data matrix
-    log.info("Applying a physical 180-degree roll to the AMSR2 data matrix...")
-    half_width = len(handler._lon) // 2
-    da = da.roll(lon=half_width, roll_coords=False)
-    
-    # Strictly attach the physical coordinates
-    da = da.assign_coords(lat=handler._lat, lon=handler._lon)
+    # 3. Read dataset
+    log.info("Opening Zarr store via icechunk session...")
+    ds = xr.open_zarr(session.store, mask_and_scale=False)
 
-    # Reverse Latitudes if descending
-    if da.lat.values[0] > da.lat.values[-1]:
-        log.info("Reversing latitude matrix to be strictly ascending...")
-        da = da.isel(lat=slice(None, None, -1))
+    # 4. Standardize the longitude automatically using xcdat
+    log.info("Standardizing longitude to [-180, 180] using xcdat...")
+    ds = xc.swap_lon_axis(ds, to=(-180, 180))
+
+    # Extract target variable (assuming "Geophysical Data" based on your original file)
+    da = ds["Geophysical Data"]
 
     # =========================================================================
     # Ensure LIS grid has lat/lon officially set as coordinates
@@ -201,7 +194,7 @@ def _regrid_amsr2(
             if rename_dict: lis_grid = lis_grid.rename(rename_dict)
             lis_grid = lis_grid.set_coords(["lat", "lon"])
         else:
-            raise ValueError(f"Could not find lat/lon in LIS grid!")
+            raise ValueError("Could not find lat/lon in LIS grid!")
 
     # Calculate LIS extents for zoomed-in plotting
     min_lon, max_lon = lis_grid.lon.min().item(), lis_grid.lon.max().item()
@@ -285,7 +278,7 @@ def _regrid_amsr2(
         return xr.DataArray(
             arr.values.astype(np.float32),
             dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
+            attrs={"long_name": long_name, "units": units, "source": "icechunk/gcom-w1-amsr2-l3-snd"},
         )
 
     return {
@@ -300,7 +293,7 @@ def _regrid_amsr2(
             "mm",
         ),
     }
-    
+
 def _regrid_ceda(
     input_dir: str,
     lis_grid: xr.Dataset,
@@ -310,45 +303,102 @@ def _regrid_ceda(
     overwrite_weights: bool = False,    
     fs=None,
 ) -> dict[str, xr.DataArray]:
-    """Regrid the file found and return {var_name: DataArray}."""
-    # Format the date to match how it appears in your filenames
-    # Example format: "20190101"
-    date_str = current_date.strftime("%Y%m%d") 
+    """Regrid the CEDA icechunk virtual store and return {var_name: DataArray}."""
     
-    all_files = _list_files(input_dir, ".nc", fs=fs)
-    if not all_files:
-        log.warning("No CEDA files found under %s — skipping", input_dir)
+    bucket = "airborne-smce-prod-user-bucket"
+    region = "us-west-2"
+    src_bucket_url = f"s3://{bucket}"
+    
+    log.info("Configuring S3 Object Store...")
+    # Initialize object store and registry
+    src_store = obstore.store.S3Store(bucket=bucket, config=obstore.store.s3_store_config())
+    registry = obstore.store.ObjectStoreRegistry({src_bucket_url: src_store})
+
+    # Get list of CEDA files
+    log.info(f"Listing CEDA files from {src_bucket_url}/JOIN/CEDA ...")
+    ceda_files = sorted(f for f in list_s3(src_store, "JOIN/CEDA") if f.endswith("nc"))
+
+    if not ceda_files:
+        log.warning("No CEDA files found in S3 store — skipping")
         return {}
 
-    files = [f for f in all_files if date_str in f]
-    
-    path = files[0]
-    log.info("CEDA: using %s", _path_name(path))
+    # Build virtual zarr store of all the CEDA data
+    parser = HDFParser()
+    ceda_urls = [f"{src_bucket_url}/{f}" for f in ceda_files]
+    vds_all = open_virtual_mfdataset(ceda_urls, parser=parser, registry=registry)
 
-    if _is_s3(path):
-        handler = handler_from_s3(CedaFileHandler, path, fs=fs)
-    else:
-        handler = CedaFileHandler.from_path(path)
+    # Create / Open icechunk store
+    dst_prefix = "JOIN/icechunk-stores/CEDA"
+    dst_store = ic.s3_storage(
+        bucket=bucket,
+        prefix=dst_prefix,
+        region=region,
+        from_env=True
+    )
 
-    ds = handler.get_dataset()
+    dst_prefix_url = f"{src_bucket_url}/JOIN/CEDA/"
+    config = ic.RepositoryConfig.default()
+    config.set_virtual_chunk_container(ic.VirtualChunkContainer(
+        dst_prefix_url,
+        ic.storage.s3_store(region=region),
+        name="ceda-s3"
+    ))
+    credentials = ic.credentials.containers_credentials(
+        {dst_prefix_url: ic.credentials.s3_credentials(from_env=True)}
+    )
 
+    # Open or create the icechunk repository
+    log.info("Opening/Creating Icechunk Repository for CEDA...")
+    repo = ic.Repository.open_or_create(dst_store, config, credentials)
+    repo.save_config()
+
+    # Create writable session and commit virtualization
+    session = repo.writable_session("main")
+    vds_all.vz.to_icechunk(session.store)
+    commit_id = session.commit("Virtualize CEDA data in airborne-smce-prod-user-bucket")
+    log.info(f"Committed icechunk store: {commit_id}")
+
+    # Open read-only session for querying
+    session_ro = repo.readonly_session("main")
+    ds_all = xr.open_zarr(session_ro.store)
+
+    # Select the specific date requested for the pipeline
+    try:
+        # Assuming the dataset has a 'time' dimension we can select against
+        ds = ds_all.sel(time=current_date, method="nearest")
+    except KeyError:
+        log.warning("Time dimension missing or differs in CEDA store, falling back to full store")
+        ds = ds_all
+
+    log.info("CEDA dataset loaded via virtualized icechunk store.")
+
+    # ---------------------------------------------------------
+    # Regridding Logic
+    # ---------------------------------------------------------
     lat_vals = ds["lat"].values if "lat" in ds else ds["y"].values
     lon_vals = ds["lon"].values if "lon" in ds else ds["x"].values
     if lat_vals.ndim == 2:
         lat_vals = lat_vals[:, 0]
     if lon_vals.ndim == 2:
         lon_vals = lon_vals[0, :]
+        
     source_grid = xr.Dataset(
         coords={"lat": np.sort(np.unique(lat_vals)), "lon": np.sort(np.unique(lon_vals))}
     )
 
+    from join_scratch.regrid.regular_to_regular import compute_weights, load_regridder
+    
     weights_local_dir = _ensure_local_dir(weights_dir)
     weights_path = weights_local_dir / f"ceda-lis-weights-{method}.nc"
+    
     compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
-    # Restore lat/lon as dim names for xESMF
-    ds_xesmf = ds.swap_dims({"y": "lat", "x": "lon"})
+    # Restore lat/lon as dim names for xESMF if necessary
+    if "y" in ds.dims and "x" in ds.dims:
+        ds_xesmf = ds.swap_dims({"y": "lat", "x": "lon"})
+    else:
+        ds_xesmf = ds
 
     log.info("CEDA: regridding swe and swe_std …")
     rg = regridder(ds_xesmf)
@@ -357,14 +407,13 @@ def _regrid_ceda(
         return xr.DataArray(
             arr.values.astype(np.float32),
             dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
+            attrs={"long_name": long_name, "units": units, "source": "icechunk/ceda-virtualized"},
         )
 
     return {
         "ceda_swe": _da(rg["swe"], "CEDA ESA CCI snow water equivalent", "mm"),
         "ceda_swe_std": _da(rg["swe_std"], "CEDA ESA CCI SWE standard deviation", "mm"),
     }
-
 
 # def _viirs_tile_bbox(h: int, v: int) -> tuple[float, float, float, float]:
 #     """Return (lon_min, lat_min, lon_max, lat_max) for a MODIS/VIIRS h/v tile.
@@ -745,15 +794,13 @@ def _regrid_icesat2(
     current_date,  # pd.Timestamp
     source_path: str = None
 ) -> dict[str, xr.DataArray]:
-    import logging
-    import numpy as np
-    import pandas as pd
-    import xarray as xr
-    from join_scratch.regrid import regrid
-    from pyresample.geometry import SwathDefinition
-
+    """
+    Slices the pre-loaded ICESat-2 dataset for the current_date, regrids to the 
+    LIS area, and subtracts the pre-computed static 3DEP DEM to compute snow depth.
+    """
     log = logging.getLogger(__name__)
 
+    # 1. Filter for the current day
     start_of_day = str(current_date.date())
     end_of_day = str((current_date + pd.Timedelta(days=1)).date())
     
@@ -763,60 +810,25 @@ def _regrid_icesat2(
         da_daily = []
 
     if len(da_daily) == 0:
-        log.warning(f"ICESat-2: No data found for {start_of_day}. Returning empty (NaN) grid.")
-        
-        # Create an array of NaNs matching the shape of the LIS grid
-        empty_vals = np.full(lis_dem.shape, np.nan, dtype=np.float32)
-        dims = lis_dem.dims
-        
-        return {
-            "icesat2_snow_depth": xr.DataArray(
-                empty_vals, dims=dims,
-                attrs={"long_name": "ICESat-2 estimated snow depth", "units": "meters"}
-            ),
-            "icesat2_h_li": xr.DataArray(
-                empty_vals, dims=dims,
-                attrs={"long_name": "ICESat-2 ATL06 land-ice surface height", "units": "meters"}
-            )
-        }
+        log.warning(f"ICESat-2: No data found for {start_of_day}. Skipping.")
+        return {}
 
-    # 1. Use .values to strip xarray metadata and save memory in Pyresample
-    source_area = SwathDefinition(lons=da_daily.lon.values, lats=da_daily.lat.values)
+    # 2. Rebuild SwathDefinition using the SLICED coordinates
+    # This ensures the lat/lon arrays exactly match the size of the filtered data
+    source_area = SwathDefinition(lons=da_daily.lon, lats=da_daily.lat)
     
-    # 2. Regrid
+    # 3. Regrid the raw h_li (surface height) to the LIS grid
     log.info(f"ICESat-2: Regridding {len(da_daily)} observations for {start_of_day} to LIS grid...")
     rg_h_li = regrid(da_daily, source_area, lis_area, method="mean")
     
-    # 3. EXTRACT RAW NUMPY ARRAYS
-    ice_vals = rg_h_li.values
-    dem_vals = lis_dem.values
-    
-    # 4. Pure NumPy Math
+    # 4. Subtract the static LIS DEM to compute snow depth
     log.info("ICESat-2: Subtracting static 3DEP DEM to compute snow depth...")
-    
-    # Mask invalid values
-    ice_vals = np.where(ice_vals < 10000, ice_vals, np.nan)
-    dem_vals = np.where(dem_vals > -9000, dem_vals, np.nan)
-    
-    # Subtract
-    snow_depth_vals = ice_vals - dem_vals
-
-    ## REENABLE this below if science team wants the ICESAT-2 masking
-    
-    # Filter physical extremes (Clouds, anomalies, deep pits)
-    # Keeping values between -15m and +40m
-    # snow_depth_vals = np.where(
-    #     (snow_depth_vals >= -15) & (snow_depth_vals <= 40),
-    #     snow_depth_vals,
-    #     np.nan
-    # )
-    
-    valid_final = np.count_nonzero(~np.isnan(snow_depth_vals))
-    log.info(f"ICESat-2: Successfully computed {valid_final} valid snow depth pixels.")
+    snow_depth_vals = rg_h_li.values - lis_dem.values
     
     dims = lis_dem.dims
     source_name = source_path if source_path else "ICESat-2 Parquet"
-    
+
+    # 5. Return both the derived snow depth and the raw regridded height
     return {
         "icesat2_snow_depth": xr.DataArray(
             snow_depth_vals.astype(np.float32),
@@ -837,7 +849,7 @@ def _regrid_icesat2(
             },
         )
     }
-    
+
 def _write_output(ds_out: xr.Dataset, output_path: str, encoding: dict, fs=None) -> None:
     """Write *ds_out* to *output_path*, which may be a local path or S3 URI."""
     if _is_s3(output_path):
@@ -860,11 +872,15 @@ def _write_output(ds_out: xr.Dataset, output_path: str, encoding: dict, fs=None)
 
 
 
+# ── main ──────────────────────────────────────────────────────────────────────
+
 def main() -> None:
+    
+    
     parser = argparse.ArgumentParser(
         description=(
             "Regrid all SWE input datasets to the LIS grid and combine into "
-            "daily NetCDF files. All paths may be local or s3:// URIs."
+            "a single NetCDF file.  All paths may be local or s3:// URIs."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -885,8 +901,7 @@ def main() -> None:
     parser.add_argument("--weights-dir", default="_data/weights",
                         help="Local directory for xESMF weights files.")
     parser.add_argument("--output-path", default="_data/swe_combined.nc",
-                        help="Base output path. Dates will be injected automatically.")
-    
+                        help="Output combined NetCDF path (local or s3://).")
     # Per-dataset method overrides
     parser.add_argument("--amsr2-method", default="bilinear",
                         choices=["bilinear", "nearest_s2d", "conservative"],
@@ -901,7 +916,6 @@ def main() -> None:
                         help="Always recompute xESMF weights even if cached files exist.")
     parser.add_argument("--max-viirs-tiles", type=int, default=None, metavar="N",
                         help="Abort before loading if the filtered VIIRS tile count exceeds N.")
-    
     ns = parser.parse_args()
 
     # Build a shared fsspec store if any S3 paths are present
@@ -912,12 +926,11 @@ def main() -> None:
     )
     fs = make_fs() if any_s3 else None
 
-    log.info("Loading LIS grid and AreaDefinition...")
     lis_grid = load_lis_grid(ns.lis_path, fs=fs)    
     lis_area = build_lis_area_definition(ns.lis_path, fs=fs, cache_dir=ns.weights_dir, overwrite=ns.overwrite_weights)
 
-    # =========================================================================
-    # --- LOAD PRE-COMPUTED DEM ---
+     # =========================================================================
+    # --- NEW: LOAD PRE-COMPUTED DEM ---
     # =========================================================================
     dem_parquet_path = Path("./_data/dem/lis_dem.parquet")
     if dem_parquet_path.exists():
@@ -947,87 +960,129 @@ def main() -> None:
         if not _is_s3(ns.icesat2_parquet) and not Path(ns.icesat2_parquet).exists():
             log.warning(f"ICESat-2 Parquet not found at {ns.icesat2_parquet} — skipping ICESat-2.")
         else:
-            if _is_s3(ns.icesat2_parquet):
-                handler = handler_from_s3(Icesat2FileHandler, ns.icesat2_parquet, fs=fs)
-            else:
-                handler = Icesat2FileHandler.from_path(ns.icesat2_parquet)
+            handler = Icesat2FileHandler.from_path(ns.icesat2_parquet)
             icesat2_full_da = handler.get_dataset()
 
     # Generate a list of daily dates
     dates = pd.date_range(start=ns.start_date, end=ns.end_date, freq='D')
     
-    # -------------------------------------------------------------------------
-    # MAIN TIME LOOP
-    # -------------------------------------------------------------------------
+    all_daily_datasets = []
+
     for current_date in dates:
-        # Use %Y%m%d to get '20190101' instead of '2019-01-01'
-        date_str = current_date.strftime('%Y%m%d') 
-        log.info(f"--- Processing date: {date_str} ---")     
+        log.info(f"--- Processing date: {current_date.strftime('%Y-%m-%d')} ---")    
     
         data_vars: dict[str, xr.DataArray] = {}
 
-        if ns.amsr2_dir is not None:
-            data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir, current_date, overwrite_weights=ns.overwrite_weights, fs=fs))
-    
-        if ns.ceda_dir is not None:
-            data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir, current_date, overwrite_weights=ns.overwrite_weights, fs=fs))
-    
-        if ns.viirs_dir is not None:
-            data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
-    
-        if icesat2_full_da is not None:
-            icesat2_vars = _regrid_icesat2(
-                icesat2_full_da,   
-                lis_area,
-                lis_dem,           
-                current_date,
-                source_path=ns.icesat2_parquet
+        try:
+            log.info("Starting AMSR2 Icechunk Regridding...")
+            amsr2_vars = _regrid_amsr2(
+                input_dir=None,  # No longer needed, configured internally 
+                lis_grid=lis_grid,
+                method="bilinear",
+                weights_dir=ns.weights_dir,
+                current_date=current_date,
+                overwrite_weights=ns.overwrite_weights,
+                fs=None
             )
-            data_vars.update(icesat2_vars)
+            data_vars.update(amsr2_vars)
+        except Exception as e:
+            log.error(f"AMSR2 processing failed for {current_date}: {e}")
+        
+        # try:
+        #     log.info("Starting CEDA Icechunk Regridding...")
+        #     ceda_vars = _regrid_ceda(
+        #         input_dir=None,  # No longer needed, configured internally
+        #         lis_grid=lis_grid,
+        #         method="bilinear",
+        #         weights_dir=ns.weights_dir,
+        #         current_date=current_date,
+        #         overwrite_weights=ns.overwrite_weights,
+        #         fs=None
+        #     )
+        #     data_vars.update(ceda_vars)
+        # except Exception as e:
+        #     log.error(f"CEDA processing failed for {current_date}: {e}")
+            
+        # if ns.viirs_dir is not None:
+        #     data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
     
-        # Check if we actually found any data for today
+        # # Pass the PRE-LOADED dataset instead of the file path
+        # if icesat2_full_da is not None:
+        #     icesat2_vars = _regrid_icesat2(
+        #         icesat2_full_da,   # Pass the actual DataArray, not the string path
+        #         lis_area,
+        #         lis_dem,           # Pass the DEM, not lis_grid
+        #         current_date,
+        #         source_path=ns.icesat2_parquet
+        #     )
+        #     data_vars.update(icesat2_vars)
+    
         if not data_vars:
-            log.warning(f"No valid data found for {date_str}. Skipping file generation.")
-            continue
+            log.error(
+                "No input directories provided or no data found. "
+                "Pass at least one of --amsr2-dir, --ceda-dir, --viirs-dir, --icesat2-parquet."
+            )
+            raise SystemExit(1)
 
-        # Build a perfectly flat 2D daily dataset (NO 'time' dimension!)
+        # Build a daily dataset AND add the 'time' dimension
         ds_day = xr.Dataset(
             data_vars,
             coords={
                 "lat": lis_grid["lat"],
-                "lon": lis_grid["lon"]
-            },
-            attrs={
-                "description": f"Daily combined SWE and snow-cover observations for {date_str}.",
-                "date": date_str,
-                "conventions": "CF-1.8",
+                "lon": lis_grid["lon"],
+                "time": [current_date]  
             }
         )
+        all_daily_datasets.append(ds_day)
 
-        # Build the dynamic output filename
-        out_path_obj = Path(ns.output_path)
-        if out_path_obj.suffix == '.nc':
-            daily_out_path = out_path_obj.parent / f"{out_path_obj.stem}_{date_str}{out_path_obj.suffix}"
-        else:
-            out_path_obj.mkdir(parents=True, exist_ok=True)
-            daily_out_path = out_path_obj / f"swe_combined_{date_str}.nc"
+    if not all_daily_datasets:
+        log.error("No data processed for any dates!")
+        raise SystemExit(1)
 
-        # Write the final NetCDF
-        encoding = {
-            var: {"dtype": "float32", "_FillValue": np.float32("nan"), "zlib": True}
-            for var in ds_day.data_vars
-        }
-        
-        log.info(f"Writing daily output to {daily_out_path} …")
-        ds_day.to_netcdf(daily_out_path, encoding=encoding)
-        
-        # Explicitly close and clean up to prevent memory spikes
-        ds_day.close()
-        del ds_day
-        
-        log.info(f"Finished {date_str} successfully!")
+    # Concatenate all daily datasets along the new 'time' dimension
+    log.info("Concatenating all dates along the time dimension...")
+    ds_out = xr.concat(all_daily_datasets, dim="time")
 
-    log.info("Workflow complete. All valid daily files have been generated.")
+    # Write the final combined NetCDF
+    encoding = {
+        var: {"dtype": "float32", "_FillValue": np.float32("nan"), "zlib": True}
+        for var in ds_out.data_vars
+    }
+    
+    log.info(f"Writing combined output to {ns.output_path} …")
+    ds_out.to_netcdf(ns.output_path, encoding=encoding)
+    log.info("Done!")
 
+    # # Build combined Dataset with shared LIS lat/lon coordinates
+    # ds_out = xr.Dataset(
+    #     data_vars,
+    #     coords={
+    #         "lat": lis_grid["lat"],
+    #         "lon": lis_grid["lon"],
+    #     },
+    #     attrs={
+    #         "description": (
+    #             "Combined SWE and snow-cover observations regridded to the "
+    #             "LIS 1 km Lambert Conformal grid (Missouri/NMP domain)."
+    #         ),
+    #         "conventions": "CF-1.8",
+    #     },
+    # )
+
+    # encoding = {
+    #     var: {"dtype": "float32", "_FillValue": np.float32("nan")}
+    #     for var in data_vars
+    # }
+
+    # log.info("Writing combined output to %s …", ns.output_path)
+    # _write_output(ds_out, ns.output_path, encoding, fs=fs)
+    # log.info("Done: %s", ns.output_path)
+
+    # log.info("Variables written:")
+    # for var in data_vars:
+    #     shape = data_vars[var].shape
+    #     log.info("  %-45s %s", var, shape)
+
+            
 if __name__ == "__main__":
     main()

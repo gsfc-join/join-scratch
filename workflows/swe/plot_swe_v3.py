@@ -85,8 +85,7 @@ def plot_variable_2d(
         reference grid instead so the axes are still georeferenced visually.
     
     """
-    print(ds)
-    
+   
     # --- pull raw arrays -------------------------------------------------
     lon = np.asarray(ds[lon_name].values, dtype="float64")
     lat = np.asarray(ds[lat_name].values, dtype="float64")
@@ -241,9 +240,11 @@ def main(
         "viirs_cgf_ndsi_snow_cover",
         "icesat2_snow_depth",
         "icesat2_h_li",
+        "icesat2_3dep_dem_10m",
     ]
 
     for var in variables_to_plot:
+        print(f"working on {var}...")
         if var not in ds.variables:
             log.warning(f"Variable '{var}' not found. Skipping.")
             continue

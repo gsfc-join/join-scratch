@@ -1,0 +1,25 @@
+channels:
+  - conda-forge
+dependencies:
+  - ipykernel
+  - pip
+  - xarray
+  - geopandas
+  - sliderule
+  - cartopy
+  - scipy
+  - pyresample
+  - obstore
+  - fsspec
+  - h5py
+  - satpy
+  - xesmf
+  - py3dep
+  - xoak
+  - earthaccess
+  - boto3
+  - h5netcdf
+  - icechunk>=2.1.1
+  - xcdat
+  - matplotlib
+variables: {}

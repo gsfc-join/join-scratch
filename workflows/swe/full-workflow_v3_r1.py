@@ -69,6 +69,7 @@ from pathlib import Path
 
 import pandas as pd
 from pyresample.geometry import SwathDefinition 
+from pyresample.kd_tree import resample_nearest
 
 import os
 import boto3
@@ -172,21 +173,29 @@ def _regrid_amsr2(
     else:
         handler = Amsr2FileHandler.from_path(path)
 
-    # 1. Load dataset, rename dimensions
+   # 1. Load dataset, rename dimensions
     da = handler.get_dataset().rename({"y": "lat", "x": "lon"})
     
-    # 2. Fix the 180-degree phase shift in the source data matrix
-    log.info("Applying a physical 180-degree roll to the AMSR2 data matrix...")
-    half_width = len(handler._lon) // 2
+    # Grab the raw 1D coordinate arrays
+    raw_lons = handler._lon.copy()
+    raw_lats = handler._lat.copy()
+    
+    # FORCE -180 to 180 longitude convention
+    raw_lons = np.where(raw_lons > 180, raw_lons - 360, raw_lons)
+    
+    # 2. Fix the 180-degree phase shift in BOTH data and coordinates
+    # The L3 global grids usually need both the data and the longitude array rolled!
+    log.info("Applying a physical 180-degree roll to the AMSR2 data matrix and coordinates...")
+    half_width = len(raw_lons) // 2
+    
+    # Roll the data array
     da = da.roll(lon=half_width, roll_coords=False)
     
-    # Strictly attach the physical coordinates
-    da = da.assign_coords(lat=handler._lat, lon=handler._lon)
-
-    # Reverse Latitudes if descending
-    if da.lat.values[0] > da.lat.values[-1]:
-        log.info("Reversing latitude matrix to be strictly ascending...")
-        da = da.isel(lat=slice(None, None, -1))
+    # Roll the longitude array so it matches the newly shifted data
+    rolled_lons = np.roll(raw_lons, half_width)
+    
+    # Strictly attach the fixed, rolled, -180/180 coordinates!
+    da = da.assign_coords(lat=raw_lats, lon=rolled_lons)
 
     # =========================================================================
     # Ensure LIS grid has lat/lon officially set as coordinates
@@ -224,10 +233,17 @@ def _regrid_amsr2(
             y_var = 'lat' if 'lat' in coords else ('latitude' if 'latitude' in coords else ('north_south' if 'north_south' in coords else None))
             
             plot_kwargs = {'ax': ax, 'transform': ccrs.PlateCarree(), 'cmap': "Blues", 'cbar_kwargs': {'shrink': 0.6}}
-            if x_var and y_var:
+            
+            # Explicitly force 'x' and 'y' to point to the attached coordinate matrices
+            if "lon" in data_array.coords and "lat" in data_array.coords:
+                plot_kwargs.update({'x': 'lon', 'y': 'lat'})
+            elif x_var and y_var:
                 plot_kwargs.update({'x': x_var, 'y': y_var})
+                
             if vmax is not None:
                 plot_kwargs['vmax'] = vmax
+
+            print(f'vmax is {vmax}')
                 
             data_array.plot.pcolormesh(**plot_kwargs)
         except Exception as e:
@@ -256,11 +272,16 @@ def _regrid_amsr2(
     
     # This will naturally skip computing if the file exists and overwrite_weights=False
     compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
+    #compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=True)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
     # 6. Extract the data and apply the regridder
     ds_mean = da.isel(inner=0).drop_vars("inner", errors="ignore").to_dataset(name="Geophysical Data")
     ds_unc  = da.isel(inner=1).drop_vars("inner", errors="ignore").to_dataset(name="Geophysical Data")
+
+    # Quick diagnostic: does the native data even have values here?
+    valid_native = np.count_nonzero(~np.isnan(ds_mean["Geophysical Data"].values))
+    log.info(f"AMSR2 native matrix has {valid_native} valid pixels before regridding.")
 
     log.info("AMSR2: regridding mean (inner=0) …")
     rg_mean = regridder(ds_mean)["Geophysical Data"]
@@ -273,7 +294,9 @@ def _regrid_amsr2(
     log.info(f"Setting plot colorbar maximum to {plot_vmax:.2f}")
 
     # PLOT 1 (Delayed): Native Data using the regridded max value
-    _debug_plot(da_mean_native, "AMSR2 Native Grid (Central U.S.)", "amsr2_01_native.png", extents=lis_extents, vmax=plot_vmax)
+    da_plot_native = da_mean_native.sortby("lon")
+    
+    _debug_plot(da_plot_native, "AMSR2 Native Grid (Central U.S.)", "amsr2_01_native.png", extents=lis_extents, vmax=plot_vmax)
 
     # PLOT 3: Final Regridded map
     _debug_plot(rg_mean, "AMSR2 Regridded (Central U.S.)", "amsr2_03_regridded.png", extents=lis_extents, vmax=plot_vmax)
@@ -739,102 +762,185 @@ def _regrid_viirs(
 #     }
 
 def _regrid_icesat2(
-    icesat2_full_da: xr.DataArray,
+    df_full,  # Now taking a pandas DataFrame
     lis_area,
-    lis_dem: xr.DataArray,
-    current_date,  # pd.Timestamp
-    source_path: str = None
+    current_date: pd.Timestamp,
+    source_path: str,
+    fs=None,
 ) -> dict[str, xr.DataArray]:
-    import logging
-    import numpy as np
-    import pandas as pd
-    import xarray as xr
-    from join_scratch.regrid import regrid
-    from pyresample.geometry import SwathDefinition
 
-    log = logging.getLogger(__name__)
-
-    start_of_day = str(current_date.date())
-    end_of_day = str((current_date + pd.Timedelta(days=1)).date())
+    print("starting the _regrid_icesat2")
+    
+    """Regrid ICESat-2 ATL06 data and compute snow depth (h_li - mosaic.stats.median)."""
+    
+    # 1. TEMPORAL FILTERING: Slice data for the current 24-hour period
+    date_str = current_date.strftime('%Y-%m-%d')
+    start_of_day = f"{date_str} 00:00:00"
+    end_of_day = f"{date_str} 23:59:59"
     
     try:
-        da_daily = icesat2_full_da.sel(time=slice(start_of_day, end_of_day))
-    except KeyError:
-        da_daily = []
-
-    if len(da_daily) == 0:
-        log.warning(f"ICESat-2: No data found for {start_of_day}. Returning empty (NaN) grid.")
+        # Pandas allows string-based date slicing if 'time' is the index
+        df_daily = df_full.loc[start_of_day:end_of_day]
+    except Exception as e:
+        log.warning(f"ICESat-2: Failed to filter by time: {e}")
+        return {}
         
-        # Create an array of NaNs matching the shape of the LIS grid
-        empty_vals = np.full(lis_dem.shape, np.nan, dtype=np.float32)
-        dims = lis_dem.dims
+    # If the slice is empty, skip this date
+    if len(df_daily) == 0:
+        log.info(f"ICESat-2: No data points found for {date_str}")
+        return {}
+
+    log.info(f"ICESat-2: Found {len(df_daily)} points for {date_str}. Regridding to LIS grid...")
+
+    # Extract required arrays using Pandas to_numeric to safely force float conversion
+    try:
+        import pandas as pd
+        import numpy as np
         
-        return {
-            "icesat2_snow_depth": xr.DataArray(
-                empty_vals, dims=dims,
-                attrs={"long_name": "ICESat-2 estimated snow depth", "units": "meters"}
-            ),
-            "icesat2_h_li": xr.DataArray(
-                empty_vals, dims=dims,
-                attrs={"long_name": "ICESat-2 ATL06 land-ice surface height", "units": "meters"}
-            )
-        }
+        lons = pd.to_numeric(df_daily["lon"], errors="coerce").to_numpy(dtype=np.float64)
+        lats = pd.to_numeric(df_daily["lat"], errors="coerce").to_numpy(dtype=np.float64)
+        h_li = pd.to_numeric(df_daily["h_li"], errors="coerce").to_numpy(dtype=np.float64)
+        
+        # Unpack the list structure in mosaic.stats.median
+        if "mosaic.stats.median" in df_daily.columns:
+            # Custom function to grab the first item if it's a list, otherwise NaN
+            def extract_val(x):
+                if isinstance(x, (list, np.ndarray)):
+                    return x[0] if len(x) > 0 else np.nan
+                return x # In case it's already a float
+                
+            # Apply unpacking, then coerce to float64
+            dem_vals_unpacked = df_daily["mosaic.stats.median"].apply(extract_val)
+            dem_vals = pd.to_numeric(dem_vals_unpacked, errors="coerce").to_numpy(dtype=np.float64)
+        else:
+            log.warning("ICESat-2: 'mosaic.stats.median' column not found in Parquet. Cannot compute snow depth.")
+            return {}
+            
+    except Exception as e:
+        log.error(f"ICESat-2: Error extracting column values: {e}")
+        return {}
+    
+    # Calculate snow depth
+    # Calculate snow depth
+    snow_depth_vals = h_li - dem_vals
+    
+    # ---------------------------------------------------------
+    # NEW DIAGNOSTICS: Inspect the 1D track before regridding
+    # ---------------------------------------------------------
+    # 1. How many points are exactly zero?
+    # exact_zeros = np.count_nonzero(snow_depth_vals == 0.0)
+    
+    # 2. How many points have identical h_li and dem_vals? 
+    # (Should match exact_zeros unless NaNs are involved)
+    # identical_vals = np.count_nonzero(h_li == dem_vals)
+    
+    # 3. What is the physical range of the non-zero snow depths?
+    # valid_mask = ~np.isnan(snow_depth_vals)
+    # if np.any(valid_mask):
+    #     snow_min = np.nanmin(snow_depth_vals)
+    #     snow_max = np.nanmax(snow_depth_vals)
+    #     snow_mean = np.nanmean(snow_depth_vals)
+    # else:
+    #     snow_min, snow_max, snow_mean = np.nan, np.nan, np.nan
+        
+    # log.info(f"ICESat-2 Track Diagnostics:")
+    # log.info(f"  -> Exact Zeros (h_li == dem): {exact_zeros} points")
+    # log.info(f"  -> Non-Zero Valid Points: {np.count_nonzero(valid_mask) - exact_zeros}")
+    # log.info(f"  -> Snow Depth Range: Min={snow_min:.2f}m, Max={snow_max:.2f}m, Mean={snow_mean:.2f}m")
+    # ---------------------------------------------------------
+    
+    # ---------------------------------------------------------
+    # FILTER PHYSICAL ANOMALIES (Clouds, Canopy, Deep Canyons)
+    # ---------------------------------------------------------
+    # Realistic snow depth limits (e.g., -5m to +25m to account for some DEM error/drifts)
+    snow_depth_vals = np.where(
+        (snow_depth_vals >= -10.0) & (snow_depth_vals <= 30.0),
+        snow_depth_vals,
+        np.nan
+    )
+    
+    valid_filtered = np.count_nonzero(~np.isnan(snow_depth_vals))
+    log.info(f"ICESat-2: Retained {valid_filtered} realistic snow depth points after physical filtering.")
+    
+    # # QUICK DEBUG: Check valid counts
+    # valid_hli = np.count_nonzero(~np.isnan(h_li))
+    # valid_dem = np.count_nonzero(~np.isnan(dem_vals))
+    # valid_snow = np.count_nonzero(~np.isnan(snow_depth_vals))
+    # log.info(f"ICESat-2 Debug: valid h_li={valid_hli}, valid dem={valid_dem}, valid snow={valid_snow}")
 
-    # 1. Use .values to strip xarray metadata and save memory in Pyresample
-    source_area = SwathDefinition(lons=da_daily.lon.values, lats=da_daily.lat.values)
-    
-    # 2. Regrid
-    log.info(f"ICESat-2: Regridding {len(da_daily)} observations for {start_of_day} to LIS grid...")
-    rg_h_li = regrid(da_daily, source_area, lis_area, method="mean")
-    
-    # 3. EXTRACT RAW NUMPY ARRAYS
-    ice_vals = rg_h_li.values
-    dem_vals = lis_dem.values
-    
-    # 4. Pure NumPy Math
-    log.info("ICESat-2: Subtracting static 3DEP DEM to compute snow depth...")
-    
-    # Mask invalid values
-    ice_vals = np.where(ice_vals < 10000, ice_vals, np.nan)
-    dem_vals = np.where(dem_vals > -9000, dem_vals, np.nan)
-    
-    # Subtract
-    snow_depth_vals = ice_vals - dem_vals
+    # Create the source area definition for Pyresample from the flat arrays
+    lons_da = xr.DataArray(lons, dims=["obs"])
+    lats_da = xr.DataArray(lats, dims=["obs"])
+    source_def = SwathDefinition(lons=lons_da, lats=lats_da)
 
-    ## REENABLE this below if science team wants the ICESAT-2 masking
+    # Wrap the pure float64 data arrays AND attach the source_def to their metadata
+    da_snow = xr.DataArray(snow_depth_vals, dims=["obs"])
+    da_snow.attrs["area"] = source_def
+
+    da_h_li = xr.DataArray(h_li, dims=["obs"])
+    da_h_li.attrs["area"] = source_def
+
+    da_dem = xr.DataArray(dem_vals, dims=["obs"])
+    da_dem.attrs["area"] = source_def
+
+    # Use the existing regrid wrapper
+    from join_scratch.regrid import regrid
     
-    # Filter physical extremes (Clouds, anomalies, deep pits)
-    # Keeping values between -15m and +40m
-    # snow_depth_vals = np.where(
-    #     (snow_depth_vals >= -15) & (snow_depth_vals <= 40),
-    #     snow_depth_vals,
-    #     np.nan
-    # )
+    log.info("ICESat-2: Regridding snow depth...")
+    rg_snow_depth = regrid(da_snow, source_def, lis_area, method="mean")
     
-    valid_final = np.count_nonzero(~np.isnan(snow_depth_vals))
-    log.info(f"ICESat-2: Successfully computed {valid_final} valid snow depth pixels.")
+    log.info("ICESat-2: Regridding h_li...")
+    rg_h_li = regrid(da_h_li, source_def, lis_area, method="mean")
+
+    log.info("ICESat-2: Regridding 3DEP DEM...")
+    rg_dem = regrid(da_dem, source_def, lis_area, method="mean")
+
+    log.info("ICESat-2: Regridding snow depth...")
+    rg_snow_depth = regrid(da_snow, source_def, lis_area, method="mean")
     
-    dims = lis_dem.dims
-    source_name = source_path if source_path else "ICESat-2 Parquet"
+    log.info("ICESat-2: Regridding h_li...")
+    rg_h_li = regrid(da_h_li, source_def, lis_area, method="mean")
+
+    # ---------------------------------------------------------
+    # NEW DIAGNOSTICS: Inspect the 2D grid after regridding
+    # ---------------------------------------------------------
+    # grid_hli_valid = np.count_nonzero(~np.isnan(rg_h_li.values))
+    # grid_snow_valid = np.count_nonzero(~np.isnan(rg_snow_depth.values))
+    # grid_snow_zeros = np.count_nonzero(rg_snow_depth.values == 0.0)
     
+    # log.info(f"ICESat-2 Grid Diagnostics:")
+    # log.info(f"  -> Gridded h_li pixels: {grid_hli_valid}")
+    # log.info(f"  -> Gridded snow pixels (total valid): {grid_snow_valid}")
+    # log.info(f"  -> Gridded snow pixels (exactly zero): {grid_snow_zeros}")
+    # ---------------------------------------------------------
+
     return {
         "icesat2_snow_depth": xr.DataArray(
-            snow_depth_vals.astype(np.float32),
-            dims=dims,
+            rg_snow_depth.values.astype(np.float32),
+            dims=["north_south", "east_west"],
             attrs={
-                "long_name": "ICESat-2 estimated snow depth (h_li - 3DEP DEM)",
+                "long_name": "ICESat-2 estimated snow depth (h_li - mosaic.stats.median)",
                 "units": "meters",
-                "source": f"{source_name} + USGS 3DEP 10m DEM"
-            },
+                "source": f"{source_path}",
+            }
         ),
         "icesat2_h_li": xr.DataArray(
             rg_h_li.values.astype(np.float32),
-            dims=dims,
+            dims=["north_south", "east_west"],
             attrs={
-                "long_name": "ICESat-2 ATL06 land-ice surface height (mean per LIS pixel)",
+                "long_name": "ICESat-2 ATL06 land-ice surface height",
                 "units": "meters",
-                "source": source_name
-            },
+                "source": source_path,
+            }
+        ),
+        "icesat2_3dep_dem_10m": xr.DataArray(
+            rg_dem.values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={
+                "long_name": "ICESat-2 Sliderule 3DEP DEM 10M",
+                "units": "meters",
+                "source": source_path,
+            }
         )
     }
     
@@ -915,43 +1021,42 @@ def main() -> None:
     log.info("Loading LIS grid and AreaDefinition...")
     lis_grid = load_lis_grid(ns.lis_path, fs=fs)    
     lis_area = build_lis_area_definition(ns.lis_path, fs=fs, cache_dir=ns.weights_dir, overwrite=ns.overwrite_weights)
-
-    # =========================================================================
-    # --- LOAD PRE-COMPUTED DEM ---
-    # =========================================================================
-    dem_parquet_path = Path("./_data/dem/lis_dem.parquet")
-    if dem_parquet_path.exists():
-        log.info("Loading pre-computed LIS DEM from %s", dem_parquet_path)
-        import pandas as pd
-        dem_df = pd.read_parquet(dem_parquet_path)
-        
-        # Reshape the 1D DEM column back into the 2D LIS grid shape
-        dem_2d = dem_df["dem"].values.reshape(lis_grid.lon.shape)
-        
-        # Reconstruct the DataArray using the LIS grid's exact dimensions
-        lis_dem = xr.DataArray(
-            dem_2d,
-            dims=lis_grid.lon.dims,  # e.g., ('north_south', 'east_west')
-            coords={"lat": lis_grid.lat, "lon": lis_grid.lon},
-            attrs={"long_name": "USGS 3DEP 10m DEM", "units": "meters"}
-        )
-    else:
-        log.error("DEM Parquet not found at %s. Please run get_lis_dem.py first!", dem_parquet_path)
-        raise FileNotFoundError(f"Missing {dem_parquet_path}")
-    # =========================================================================
-
+  
     # Pre-load ICESat-2 data (if provided) to avoid reloading it on every date loop    
-    icesat2_full_da = None
+    icesat2_df = None
     if ns.icesat2_parquet is not None:
         log.info(f"Pre-loading ICESat-2 data from {ns.icesat2_parquet}...")
         if not _is_s3(ns.icesat2_parquet) and not Path(ns.icesat2_parquet).exists():
-            log.warning(f"ICESat-2 Parquet not found at {ns.icesat2_parquet} — skipping ICESat-2.")
+            log.warning(f"ICESat-2 file not found at {ns.icesat2_parquet} — skipping ICESat-2.")
         else:
-            if _is_s3(ns.icesat2_parquet):
-                handler = handler_from_s3(Icesat2FileHandler, ns.icesat2_parquet, fs=fs)
-            else:
-                handler = Icesat2FileHandler.from_path(ns.icesat2_parquet)
-            icesat2_full_da = handler.get_dataset()
+            try:
+                icesat2_df = pd.read_parquet(ns.icesat2_parquet)  
+                # Check what columns actually exist in the dataframe
+                log.info(f"ICESat-2 Parquet columns: {list(icesat2_df.columns)}")
+                
+                # Check if the time information is already the index
+                if icesat2_df.index.name in ['time', 'time_ns']:
+                    # Convert the index to datetime (handles both string and nanosecond integer types)
+                    icesat2_df.index = pd.to_datetime(icesat2_df.index)
+                
+                # Otherwise, check if it's a column and set it as the index
+                elif 'time_ns' in icesat2_df.columns:
+                    icesat2_df.index = pd.to_datetime(icesat2_df['time_ns'])
+                    icesat2_df.index.name = 'time_ns'
+                elif 'time' in icesat2_df.columns:
+                    icesat2_df.index = pd.to_datetime(icesat2_df['time'])
+                    icesat2_df.index.name = 'time'
+                else:
+                    log.warning("ICESat-2 data does not contain a recognizable time column/index for daily slicing.")
+
+                # SORT THE INDEX to fix the "non-monotonic" slicing error
+                if icesat2_df is not None and not icesat2_df.index.is_monotonic_increasing:
+                    log.info("Sorting ICESat-2 data by time...")
+                    icesat2_df.sort_index(inplace=True)
+        
+            except Exception as e:
+                log.error(f"Failed to read ICESat-2 parquet file: {e}")
+                icesat2_df = None
 
     # Generate a list of daily dates
     dates = pd.date_range(start=ns.start_date, end=ns.end_date, freq='D')
@@ -975,11 +1080,10 @@ def main() -> None:
         if ns.viirs_dir is not None:
             data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
     
-        if icesat2_full_da is not None:
+        if icesat2_df is not None:
             icesat2_vars = _regrid_icesat2(
-                icesat2_full_da,   
+                icesat2_df,
                 lis_area,
-                lis_dem,           
                 current_date,
                 source_path=ns.icesat2_parquet
             )
@@ -1012,11 +1116,23 @@ def main() -> None:
             out_path_obj.mkdir(parents=True, exist_ok=True)
             daily_out_path = out_path_obj / f"swe_combined_{date_str}.nc"
 
-        # Write the final NetCDF
+        # Reverse the entire dataset along the north_south dimension 
+        # (orders data from lowest to highest latitude / South to North)
+        ds_day = ds_day.isel(north_south=slice(None, None, -1))
+        
+        # 1. Fill all NaN values in the dataset with -9999.0
+        ds_day = ds_day.fillna(-9999.0)
+
+        # 2. Build the encoding dictionary for standard data variables
         encoding = {
-            var: {"dtype": "float32", "_FillValue": np.float32("nan"), "zlib": True}
+            var: {"dtype": "float32", "_FillValue": -9999.0, "zlib": True}
             for var in ds_day.data_vars
         }
+        
+        # 3. Explicitly add coordinate encoding to fix the NaNf mismatch!
+        # It's important NOT to compress (zlib) 1D/2D coordinates for faster CF-compliant reading
+        encoding["lat"] = {"dtype": "float32", "_FillValue": -9999.0}
+        encoding["lon"] = {"dtype": "float32", "_FillValue": -9999.0}
         
         log.info(f"Writing daily output to {daily_out_path} …")
         ds_day.to_netcdf(daily_out_path, encoding=encoding)

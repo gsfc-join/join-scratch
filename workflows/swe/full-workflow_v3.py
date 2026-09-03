@@ -103,9 +103,17 @@ AMSR2_GLOB = "**/*.h5"
 CEDA_GLOB = "**/*.nc"
 VIIRS_GLOB = "**/*.h5"
 
+FILL_MISSING = np.float32(-9999)
 
 # ── path helpers ──────────────────────────────────────────────────────────────
-
+def _needs_flip(lis_grid: xr.Dataset) -> bool:
+    """Return True if LIS grid is ascending (South to North)."""
+    # Assuming lat is 2D, check the first and last row of the first column
+    lat_vals = lis_grid["lat"].values
+    if lat_vals.ndim == 2:
+        return lat_vals[0, 0] < lat_vals[-1, 0]
+    return lat_vals[0] < lat_vals[-1]
+    
 def _list_files(dir_path: str, suffix: str, fs=None) -> list[str]:
     """List files under *dir_path* matching *suffix*, local or S3."""
     if _is_s3(dir_path):
@@ -182,11 +190,6 @@ def _regrid_amsr2(
     
     # Strictly attach the physical coordinates
     da = da.assign_coords(lat=handler._lat, lon=handler._lon)
-
-    # Reverse Latitudes if descending
-    if da.lat.values[0] > da.lat.values[-1]:
-        log.info("Reversing latitude matrix to be strictly ascending...")
-        da = da.isel(lat=slice(None, None, -1))
 
     # =========================================================================
     # Ensure LIS grid has lat/lon officially set as coordinates
@@ -282,8 +285,11 @@ def _regrid_amsr2(
     rg_unc  = regridder(ds_unc)["Geophysical Data"]
 
     def _da(arr, long_name, units):
+        import numpy as np
+        # Physically replace NaNs with -9999.0
+        data_filled = np.nan_to_num(arr.values, nan=-9999.0).astype(np.float32)
         return xr.DataArray(
-            arr.values.astype(np.float32),
+            data_filled,
             dims=["north_south", "east_west"],
             attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
         )
@@ -354,11 +360,14 @@ def _regrid_ceda(
     rg = regridder(ds_xesmf)
 
     def _da(arr, long_name, units):
-        return xr.DataArray(
-            arr.values.astype(np.float32),
-            dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
-        )
+            import numpy as np
+            # Physically replace NaNs with -9999.0
+            data_filled = np.nan_to_num(arr.values, nan=-9999.0).astype(np.float32)
+            return xr.DataArray(
+                data_filled,
+                dims=["north_south", "east_west"],
+                attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
+            )
 
     return {
         "ceda_swe": _da(rg["swe"], "CEDA ESA CCI snow water equivalent", "mm"),
@@ -522,9 +531,13 @@ def _regrid_viirs(
     log.info("VIIRS: regridding with method=%s …", method)
     rg = regrid(composite_da, source_def, lis_area, method=method)
 
+    # 1. Fill NaNs with -9999.0 and cast to float32
+    # (Assuming your regridded array variable is named `rg`)
+    viirs_filled = np.nan_to_num(rg.values, nan=-9999.0).astype(np.float32)
+    
     return {
         "viirs_cgf_ndsi_snow_cover": xr.DataArray(
-            rg.values.astype(np.float32),
+            viirs_filled,
             dims=["north_south", "east_west"],
             attrs={
                 "long_name": "VIIRS CGF NDSI snow cover",
@@ -816,30 +829,62 @@ def _regrid_icesat2(
     
     dims = lis_dem.dims
     source_name = source_path if source_path else "ICESat-2 Parquet"
-    
+
+    # Fill missing values in your resulting arrays (assuming they are named snow_depth_vals and ice_vals)
+    ice_vals_filled = np.nan_to_num(ice_vals, nan=-9999.0).astype(np.float32)
+    snow_depth_filled = np.nan_to_num(snow_depth_vals, nan=-9999.0).astype(np.float32)
+
     return {
         "icesat2_snow_depth": xr.DataArray(
-            snow_depth_vals.astype(np.float32),
-            dims=dims,
+            snow_depth_filled,
+            dims=["north_south", "east_west"],
             attrs={
                 "long_name": "ICESat-2 estimated snow depth (h_li - 3DEP DEM)",
                 "units": "meters",
-                "source": f"{source_name} + USGS 3DEP 10m DEM"
-            },
+                "source": f"{_path_name(source_path)} + USGS 3DEP 10m DEM",
+            }
         ),
         "icesat2_h_li": xr.DataArray(
-            rg_h_li.values.astype(np.float32),
-            dims=dims,
+            ice_vals_filled,
+            dims=["north_south", "east_west"],
             attrs={
                 "long_name": "ICESat-2 ATL06 land-ice surface height (mean per LIS pixel)",
                 "units": "meters",
-                "source": source_name
-            },
+                "source": _path_name(source_path),
+            }
         )
     }
     
 def _write_output(ds_out: xr.Dataset, output_path: str, encoding: dict, fs=None) -> None:
     """Write *ds_out* to *output_path*, which may be a local path or S3 URI."""
+    # =========================================================================
+    # --- APPLY FINAL FORMATTING (Missing Data & Latitude Order) ---
+    # =========================================================================
+    
+    # 1. Reverse the dimension to arrange latitude from South to North
+    # Assuming the LIS grid uses 'north_south' as the vertical dimension:
+    if "north_south" in ds_out.dims:
+        ds_out = ds_out.isel(north_south=slice(None, None, -1))
+    elif "y" in ds_out.dims:
+        ds_out = ds_out.isel(y=slice(None, None, -1))
+    elif "lat" in ds_out.dims:
+        # If 'lat' is a 1D coordinate, we can just sort it in ascending order
+        ds_out = ds_out.sortby("lat")
+    
+    # 2. Replace NaN values with -9999.0
+    ds_out = ds_out.fillna(-9999.0)
+    
+    # 3. Add `_FillValue` to the encoding dictionary so netCDF readers know 
+    # that -9999.0 represents missing data
+    if "encoding" not in locals():
+        encoding = {}
+    
+    for var in ds_out.data_vars:
+        if var not in encoding:
+            encoding[var] = {}
+        encoding[var]["_FillValue"] = -9999.0
+
+# =========================================================================
     if _is_s3(output_path):
         if fs is None:
             fs = make_fs()
@@ -868,7 +913,6 @@ def main() -> None:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
     parser.add_argument("--start-date", required=True, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", required=True, help="End date (YYYY-MM-DD)")
     
@@ -904,17 +948,15 @@ def main() -> None:
     
     ns = parser.parse_args()
 
-    # Build a shared fsspec store if any S3 paths are present
-    any_s3 = any(
-        _is_s3(str(p))
-        for p in [ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir, ns.icesat2_parquet]
-        if p is not None
-    )
-    fs = make_fs() if any_s3 else None
+    # Determine filesystem based on inputs
+    fs = make_fs() if any(_is_s3(p) for p in [
+        ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir, ns.icesat2_parquet, ns.output_path
+    ] if p) else None
 
-    log.info("Loading LIS grid and AreaDefinition...")
-    lis_grid = load_lis_grid(ns.lis_path, fs=fs)    
-    lis_area = build_lis_area_definition(ns.lis_path, fs=fs, cache_dir=ns.weights_dir, overwrite=ns.overwrite_weights)
+    # Load target grid geometry
+    log.info(f"Loading LIS domain from {ns.lis_path} …")
+    lis_area = build_lis_area_definition(ns.lis_path, fs=fs)
+    lis_grid = load_lis_grid(ns.lis_path, fs=fs)
 
     # =========================================================================
     # --- LOAD PRE-COMPUTED DEM ---
@@ -965,7 +1007,7 @@ def main() -> None:
         log.info(f"--- Processing date: {date_str} ---")     
     
         data_vars: dict[str, xr.DataArray] = {}
-
+        
         if ns.amsr2_dir is not None:
             data_vars.update(_regrid_amsr2(ns.amsr2_dir, lis_grid, ns.amsr2_method, ns.weights_dir, current_date, overwrite_weights=ns.overwrite_weights, fs=fs))
     
@@ -989,8 +1031,8 @@ def main() -> None:
         if not data_vars:
             log.warning(f"No valid data found for {date_str}. Skipping file generation.")
             continue
-
-        # Build a perfectly flat 2D daily dataset (NO 'time' dimension!)
+        
+        # 1. Build a perfectly flat 2D daily dataset (NO 'time' dimension!)
         ds_day = xr.Dataset(
             data_vars,
             coords={
@@ -999,27 +1041,66 @@ def main() -> None:
             },
             attrs={
                 "description": f"Daily combined SWE and snow-cover observations for {date_str}.",
-                "date": date_str,
-                "conventions": "CF-1.8",
+                "projection": "Lambert Conformal Conic (LIS matching)"
             }
         )
-
-        # Build the dynamic output filename
-        out_path_obj = Path(ns.output_path)
-        if out_path_obj.suffix == '.nc':
-            daily_out_path = out_path_obj.parent / f"{out_path_obj.stem}_{date_str}{out_path_obj.suffix}"
-        else:
-            out_path_obj.mkdir(parents=True, exist_ok=True)
-            daily_out_path = out_path_obj / f"swe_combined_{date_str}.nc"
-
-        # Write the final NetCDF
-        encoding = {
-            var: {"dtype": "float32", "_FillValue": np.float32("nan"), "zlib": True}
-            for var in ds_day.data_vars
-        }
         
+        # Inject the date into the filename BEFORE the extension (e.g. out_20190101.nc)
+        base_path = Path(ns.output_path)
+        daily_out_name = f"{base_path.stem}_{date_str}{base_path.suffix}"
+        
+        # Reconstruct path correctly whether S3 or local
+        if _is_s3(ns.output_path):
+            parts = ns.output_path.split("/")
+            parts[-1] = daily_out_name
+            daily_out_path = "/".join(parts)
+        else:
+            daily_out_path = str(base_path.with_name(daily_out_name))
+            
+        # =========================================================================
+        # --- APPLY FINAL FORMATTING (Missing Data & Latitude Order) ---
+        # =========================================================================
+        
+        # 1. Reverse the dimension to arrange latitude from South to North
+        if "north_south" in ds_day.dims:
+            ds_day = ds_day.isel(north_south=slice(None, None, -1))
+            
+        # 2. Build encoding dict and PURGE the toxic CF attributes
+        encoding_dict = {}
+        for var in ds_day.variables:
+            # DESTROY attributes inherited from the LIS grid that force Xarray to use NaNf
+            bad_attrs = ['_FillValue', 'missing_value', 'scale_factor', 'add_offset', 'vmin', 'vmax', 'valid_range']
+            for attr in bad_attrs:
+                ds_day[var].attrs.pop(attr, None)
+                ds_day[var].encoding.pop(attr, None)
+                
+            if var in ["lat", "lon", "north_south", "east_west", "time"]:
+                # Coordinates get NO fill value
+                encoding_dict[var] = {"_FillValue": None, "dtype": "float32"}
+            else:
+                # Data variables get explicitly encoded to -9999.0
+                encoding_dict[var] = {"_FillValue": np.float32(-9999.0), "dtype": "float32"}
+
+        # =========================================================================
+            
+        # --- SAVE DAILY OUTPUT ---
+        if _is_s3(daily_out_path):
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                ds_day.to_netcdf(tmp_path, engine="h5netcdf", encoding=encoding_dict)
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
+                with fs.open(daily_out_path, "wb") as fout:
+                    fout.write(data)
+            finally:
+                os.unlink(tmp_path)
+        else:
+            Path(daily_out_path).parent.mkdir(parents=True, exist_ok=True)
+            ds_day.to_netcdf(daily_out_path, engine="h5netcdf", encoding=encoding_dict)
+            
         log.info(f"Writing daily output to {daily_out_path} …")
-        ds_day.to_netcdf(daily_out_path, encoding=encoding)
         
         # Explicitly close and clean up to prevent memory spikes
         ds_day.close()

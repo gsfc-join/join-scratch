@@ -1,6 +1,6 @@
 workflows/swe/plot
 workflows/swe/_data
-
+workflows/swe/check_icesat2_mosaic.csv
 
 # Quarto outputs
 docs/_site/

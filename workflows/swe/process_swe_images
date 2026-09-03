@@ -1,0 +1,8 @@
+python plot_swe.py ./_data/swe_combined_20190101.nc
+python plot_swe.py ./_data/swe_combined_20190102.nc
+python plot_swe.py ./_data/swe_combined_20190103.nc
+python plot_swe.py ./_data/swe_combined_20190104.nc
+python plot_swe.py ./_data/swe_combined_20190105.nc
+python plot_swe.py ./_data/swe_combined_20190106.nc
+python plot_swe.py ./_data/swe_combined_20190107.nc
+
