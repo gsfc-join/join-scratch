@@ -91,6 +91,11 @@ def plot_variable_2d(
     lat = np.asarray(ds[lat_name].values, dtype="float64")
     data = np.asarray(ds[var].values, dtype="float64")
 
+    # --- explicitly mask missing / negative data -------------------------
+    # SWE and snow depths cannot be negative. This catches -9999.0 fill values 
+    # as well as any other negative error codes xarray may have missed.
+    data = np.where(data < 0, np.nan, data)
+    
     # --- convert 0-360 longitude to -180..180 if needed ------------------
     if np.nanmax(lon) > 180.0:
         lon = np.where(lon > 180.0, lon - 360.0, lon)
@@ -125,7 +130,8 @@ def plot_variable_2d(
     y_min, y_max = float(lat_f.min()), float(lat_f.max())
 
     # --- colormap / labels -----------------------------------------------
-    cmap = "Blues" if ("swe" in var or "snow" in var) else "viridis"
+    # cmap = "Blues" if ("swe" in var or "snow" in var) else "viridis"
+    cmap = "viridis"
     unit = ds[var].attrs.get("units", ds[var].attrs.get("unit", ""))
     long_name = ds[var].attrs.get("long_name", var)
 
@@ -133,7 +139,7 @@ def plot_variable_2d(
     fig = plt.figure(figsize=(12, 8))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_extent([x_min, x_max, y_min, y_max], crs=ccrs.PlateCarree())
-
+    
     if use_scatter:
         # Plot only finite points as colored markers positioned by lat/lon.
         # No quad-mesh geometry => cannot hit the blank-Quadmesh failure.
@@ -239,7 +245,7 @@ def main(
         "ceda_swe",
         "viirs_cgf_ndsi_snow_cover",
         "icesat2_snow_depth",
-        "icesat2_h_li",
+        "icesat2_h_mean",
         "icesat2_3dep_dem_10m",
     ]
 

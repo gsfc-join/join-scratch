@@ -25,7 +25,6 @@ Usage example (local)
         --amsr2-dir /data/amsr2 \\
         --ceda-dir  /data/ceda \\
         --viirs-dir /data/viirs \\
-        --icesat2-parquet /data/icesat2/atl06.parquet \\
         --output-path /data/swe_combined.nc
 
 Usage example (S3)
@@ -35,7 +34,6 @@ Usage example (S3)
         --amsr2-dir s3://my-bucket/amsr2 \\
         --ceda-dir  s3://my-bucket/ceda \\
         --viirs-dir s3://my-bucket/viirs \\
-        --icesat2-parquet s3://my-bucket/icesat2/atl06.parquet \\
         --output-path /data/swe_combined.nc
 
 """
@@ -294,7 +292,7 @@ def _regrid_amsr2(
             dims=["north_south", "east_west"],
             attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
         )
-
+C
     return {
         "amsr2_snow_depth_mean": _da(
             rg_mean,
@@ -351,7 +349,7 @@ def _regrid_ceda(
 
     weights_local_dir = _ensure_local_dir(weights_dir)
     weights_path = weights_local_dir / f"ceda-lis-weights-{method}.nc"
-    compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
+    #compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
     # Restore lat/lon as dim names for xESMF
@@ -541,209 +539,6 @@ def _regrid_viirs(
         )
     }
 
-# def _regrid_icesat2(
-#     parquet_path: str,
-#     lis_area,
-#     lis_grid: xr.Dataset,
-#     fs=None,
-# ) -> dict[str, xr.DataArray]:
-#     """Regrid ICESat-2 ATL06 point cloud and return {var_name: DataArray}.
-
-#     For S3 URIs, the path is passed directly to geopandas.read_parquet which
-#     delegates to pyarrow's native S3 support (no FSFile wrapper needed).
-#     For local paths, existence is checked before proceeding.
-#     """
-#     if not _is_s3(parquet_path) and not Path(parquet_path).exists():
-#         log.warning("ICESat-2 Parquet not found at %s — skipping", parquet_path)
-#         return {}
-#     # Icesat2FileHandler.get_dataset calls geopandas.read_parquet(str(self.filename))
-#     # which supports s3:// URIs natively via pyarrow, so from_path without fs works.
-#     handler = Icesat2FileHandler.from_path(parquet_path)
-
-#     log.info("ICESat-2: loading from %s", parquet_path)
-#     da = handler.get_dataset()
-#     source_area = da.attrs["area"]
-#     log.info("ICESat-2: regridding %d observations using mean …", len(da))
-#     rg = regrid(da, source_area, lis_area, method="mean")
-#     return {
-#         "icesat2_h_li": xr.DataArray(
-#             rg.values.astype(np.float32),
-#             dims=["north_south", "east_west"],
-#             attrs={
-#                 "long_name": "ICESat-2 ATL06 land-ice surface height (mean per LIS pixel)",
-#                 "units": "meters",
-#                 "source": _path_name(parquet_path),
-#             },
-#         )
-#     }
-
-# def _regrid_icesat2(
-#     # parquet_path: str,
-#     da_full: xr.DataArray,
-#     lis_area,
-#     lis_grid: xr.Dataset,
-#     current_date: pd.Timestamp,
-#     source_path: str,
-#     fs=None,
-# ) -> dict[str, xr.DataArray]:
-#     """Regrid ICESat-2 ATL06 data (attempts to compute h_li - 3DEP DEM)."""
-#     import xarray as xr
-#     import numpy as np
-#     from pathlib import Path
-
-#     print(da_full)
-
-#     date_str = current_date.strftime('%Y-%m-%d')
-#     start_of_day = f"{date_str} 00:00:00"
-#     end_of_day = f"{date_str} 23:59:59"
-    
-#     # Slice the dataset for the entire 24-hour period of the current date
-#     try:
-#         da = da_full.sel(time=slice(start_of_day, end_of_day))
-#     except KeyError:
-#         log.warning(f"ICESat-2: 'time' dimension missing or invalid.")
-#         return {}
-        
-#     # If the slice is empty, skip
-#     if da.size == 0:
-#         log.info(f"ICESat-2: No data points found for {date_str}")
-#         return {}
-
-#     log.info(f"ICESat-2: Found {da.size} points for {date_str}")
-
-#     source_area = da.attrs["area"]
-#     lons = source_area.lons.values
-#     lats = source_area.lats.values
-#     h_li = da.values
-
-#     # --- 1. FILTER POINTS TO LIS BOUNDING BOX ---
-#     import math as _math
-#     corners = lis_area.outer_boundary_corners
-#     corner_lons = [_math.degrees(c.lon) for c in corners]
-#     corner_lats = [_math.degrees(c.lat) for c in corners]
-    
-#     lon_min, lon_max = min(corner_lons) - 0.1, max(corner_lons) + 0.1
-#     lat_min, lat_max = min(corner_lats) - 0.1, max(corner_lats) + 0.1
-    
-#     log.info("Filtering ICESat-2 points to LIS domain: Lon [%.2f, %.2f], Lat [%.2f, %.2f]", lon_min, lon_max, lat_min, lat_max)
-    
-#     domain_mask = (lons >= lon_min) & (lons <= lon_max) & (lats >= lat_min) & (lats <= lat_max)
-#     points_in_domain = np.sum(domain_mask)
-    
-#     log.info("Found %d of %d points inside LIS domain", points_in_domain, len(lons))
-    
-#     # Start with h_li as our baseline
-#     final_values = h_li.copy()
-
-#     # --- 2. ATTEMPT SLIDERULE 3DEP DEM EXTRACTION ---
-#     sliderule_success = False
-#     if points_in_domain > 0:
-#         log.info("Initializing SlideRule for 3DEP DEM extraction...")
-#         from sliderule import icesat2, raster
-#         import time
-#         import pandas as pd
-        
-#         try:
-#             icesat2.init("slideruleearth.io", verbose=False)
-            
-#             # 1. Vectorized filtering and coordinate generation
-#             filtered_lons = lons[domain_mask]
-#             filtered_lats = lats[domain_mask]
-            
-#             # np.column_stack is significantly faster than zip + list comprehension
-#             coords_array = np.column_stack((filtered_lons, filtered_lats))
-#             total_points = len(coords_array)
-            
-#             chunk_size = 50000
-            
-#             # 2. Pre-allocate NumPy array to avoid dynamic list resizing overhead
-#             dem_elevations = np.full(total_points, np.nan, dtype=np.float32)
-            
-#             log.info("Sampling %d points in chunks of %d using asset 'usgs3dep-10meter-dem'...", total_points, chunk_size)
-            
-#             for i in range(0, total_points, chunk_size):
-#                 end_idx = min(i + chunk_size, total_points)
-                
-#                 if (i // chunk_size) % 10 == 0:
-#                     log.info("  -> Requesting chunk %d to %d...", i, end_idx)
-                
-#                 # Convert only the current chunk to a nested Python list
-#                 chunk = coords_array[i:end_idx].tolist()
-                
-#                 # Attempt pure request without the buggy 'poly' hint
-#                 result = raster.sample("usgs3dep-10meter-dem", chunk)
-                
-#                 # 3. Streamlined result parsing
-#                 vals = []
-#                 if isinstance(result, pd.DataFrame) and not result.empty:
-#                     # Select the first numeric column directly
-#                     num_cols = result.select_dtypes(include=['number'])
-#                     if not num_cols.empty:
-#                         vals = num_cols.iloc[:, 0].values
-#                 elif isinstance(result, list) and result:
-#                     if isinstance(result[0], dict):
-#                         keys = list(result[0].keys())
-#                         vals = [item.get("value", item.get(keys[0], np.nan)) for item in result]
-#                     else:
-#                         vals = result
-                
-#                 # Convert extracted values to numpy array and assign to pre-allocated array
-#                 vals = np.array(vals, dtype=np.float32) if len(vals) > 0 else np.array([])
-                
-#                 # Handle size mismatches efficiently
-#                 valid_len = min(len(vals), end_idx - i)
-#                 if valid_len > 0:
-#                     dem_elevations[i : i + valid_len] = vals[:valid_len]
-                
-#                 time.sleep(0.1)
-                
-#             # Vectorized masking
-#             valid_mask = (dem_elevations > -9000) & (~np.isnan(dem_elevations))
-            
-#             if np.any(valid_mask): # Faster than np.sum(valid_mask) > 0
-#                 valid_count = np.count_nonzero(valid_mask)
-#                 log.info("Successfully fetched %d valid DEM elevations!", valid_count)
-                
-#                 # 4. Map back to the original domain efficiently
-#                 # Get the indices where domain_mask is True
-#                 domain_indices = np.where(domain_mask)[0] 
-                
-#                 # Update final_values only where we have valid DEM elevations
-#                 valid_domain_indices = domain_indices[valid_mask]
-#                 final_values[valid_domain_indices] -= dem_elevations[valid_mask]
-                
-#                 sliderule_success = True
-#             else:
-#                 log.warning("SlideRule successfully processed but returned entirely NoData (NaNs) for this region. Falling back to raw h_li.")
-                
-#         except Exception as e:
-#             log.error("SlideRule API Error: %s", e)
-#             log.warning("SlideRule failed or is offline. Falling back to raw h_li for ICESat-2.")
-
-#     # --- 3. REGRID TO LIS GRID ---
-#     da.values = final_values
-    
-#     # We only want to regrid the points that actually fall in the domain
-#     valid_points_count = points_in_domain
-    
-#     output_name = "icesat2_snow_depth" if sliderule_success else "icesat2_h_li"
-#     long_name = "ICESat-2 ATL06 Snow Depth (h_li - USGS 3DEP)" if sliderule_success else "ICESat-2 ATL06 land-ice surface height"
-    
-#     log.info("ICESat-2: regridding %d total observations (%d in domain) using mean …", len(da), valid_points_count)
-    
-#     rg = regrid(da, source_area, lis_area, method="mean")
-
-#     return {
-#         output_name: xr.DataArray(
-#             rg.values.astype(np.float32),
-#             dims=["north_south", "east_west"],
-#             attrs={
-#                 "long_name": long_name,
-#                 "units": "m",
-#                 "source": _path_name(parquet_path)
-#             },
-#         )
-#     }
 
 def _regrid_icesat2(
     df_full,  # Now taking a pandas DataFrame
@@ -932,8 +727,6 @@ def main() -> None:
                         help="Directory containing CEDA ESA CCI SWE NetCDF files (local or s3://).")
     parser.add_argument("--viirs-dir", default=None,
                         help="Directory containing VIIRS CGF snow cover HDF5 files (local or s3://).")
-    parser.add_argument("--icesat2-parquet", default=None,
-                        help="Path to the cached ICESat-2 ATL06 Parquet file (local or s3://).")
     parser.add_argument("--weights-dir", default="_data/weights",
                         help="Local directory for xESMF weights files.")
     parser.add_argument("--output-path", default="_data/swe_combined.nc",
@@ -959,7 +752,7 @@ def main() -> None:
     # Build a shared fsspec store if any S3 paths are present
     any_s3 = any(
         _is_s3(str(p))
-        for p in [ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir, ns.icesat2_parquet]
+        for p in [ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir]
         if p is not None
     )
     fs = make_fs() if any_s3 else None
@@ -968,42 +761,6 @@ def main() -> None:
     lis_grid = load_lis_grid(ns.lis_path, fs=fs)    
     lis_area = build_lis_area_definition(ns.lis_path, fs=fs, cache_dir=ns.weights_dir, overwrite=ns.overwrite_weights)
   
-    # Pre-load ICESat-2 data (if provided) to avoid reloading it on every date loop    
-    icesat2_df = None
-    if ns.icesat2_parquet is not None:
-        log.info(f"Pre-loading ICESat-2 data from {ns.icesat2_parquet}...")
-        if not _is_s3(ns.icesat2_parquet) and not Path(ns.icesat2_parquet).exists():
-            log.warning(f"ICESat-2 file not found at {ns.icesat2_parquet} — skipping ICESat-2.")
-        else:
-            try:
-                icesat2_df = pd.read_parquet(ns.icesat2_parquet)  
-                # Check what columns actually exist in the dataframe
-                log.info(f"ICESat-2 Parquet columns: {list(icesat2_df.columns)}")
-                
-                # Check if the time information is already the index
-                if icesat2_df.index.name in ['time', 'time_ns']:
-                    # Convert the index to datetime (handles both string and nanosecond integer types)
-                    icesat2_df.index = pd.to_datetime(icesat2_df.index)
-                
-                # Otherwise, check if it's a column and set it as the index
-                elif 'time_ns' in icesat2_df.columns:
-                    icesat2_df.index = pd.to_datetime(icesat2_df['time_ns'])
-                    icesat2_df.index.name = 'time_ns'
-                elif 'time' in icesat2_df.columns:
-                    icesat2_df.index = pd.to_datetime(icesat2_df['time'])
-                    icesat2_df.index.name = 'time'
-                else:
-                    log.warning("ICESat-2 data does not contain a recognizable time column/index for daily slicing.")
-
-                # SORT THE INDEX to fix the "non-monotonic" slicing error
-                if icesat2_df is not None and not icesat2_df.index.is_monotonic_increasing:
-                    log.info("Sorting ICESat-2 data by time...")
-                    icesat2_df.sort_index(inplace=True)
-        
-            except Exception as e:
-                log.error(f"Failed to read ICESat-2 parquet file: {e}")
-                icesat2_df = None
-
     # Generate a list of daily dates
     dates = pd.date_range(start=ns.start_date, end=ns.end_date, freq='D')
     
@@ -1026,14 +783,27 @@ def main() -> None:
         if ns.viirs_dir is not None:
             data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
     
-        if icesat2_df is not None:
-            icesat2_vars = _regrid_icesat2(
-                icesat2_df,
-                lis_area,
-                current_date,
-                source_path=ns.icesat2_parquet
-            )
-            data_vars.update(icesat2_vars)
+        # Load ICESat-2 data for this specific date from S3
+        icesat2_s3_path = f"s3://airborne-smce-prod-user-bucket/JOIN/ICESAT-2/ATL06_MOSAIC/{current_date.strftime('%Y/%m/%d')}/atl06_{date_str}.parquet"
+        try:
+            log.info(f"Loading ICESat-2 data from {icesat2_s3_path}...")
+            icesat2_df = pd.read_parquet(icesat2_s3_path)
+            
+            if len(icesat2_df) > 0:
+                log.info(f"ICESat-2 Parquet columns: {list(icesat2_df.columns)}")
+                icesat2_vars = _regrid_icesat2(
+                    icesat2_df,
+                    lis_area,
+                    current_date,
+                    source_path=icesat2_s3_path
+                )
+                data_vars.update(icesat2_vars)
+            else:
+                log.info(f"ICESat-2: No data points found for {date_str}")
+        except FileNotFoundError:
+            log.info(f"ICESat-2 file not found for {date_str} at {icesat2_s3_path}")
+        except Exception as e:
+            log.warning(f"Failed to load ICESat-2 data for {date_str}: {e}")
     
         # Check if we actually found any data for today
         if not data_vars:

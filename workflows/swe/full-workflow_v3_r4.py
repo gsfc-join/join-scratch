@@ -25,7 +25,6 @@ Usage example (local)
         --amsr2-dir /data/amsr2 \\
         --ceda-dir  /data/ceda \\
         --viirs-dir /data/viirs \\
-        --icesat2-parquet /data/icesat2/atl06.parquet \\
         --output-path /data/swe_combined.nc
 
 Usage example (S3)
@@ -35,12 +34,9 @@ Usage example (S3)
         --amsr2-dir s3://my-bucket/amsr2 \\
         --ceda-dir  s3://my-bucket/ceda \\
         --viirs-dir s3://my-bucket/viirs \\
-        --icesat2-parquet s3://my-bucket/icesat2/atl06.parquet \\
         --output-path /data/swe_combined.nc
 
 """
-
-
 
 import sys
 import argparse
@@ -50,6 +46,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import h5py
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -71,27 +68,33 @@ import pandas as pd
 from pyresample.geometry import SwathDefinition 
 from pyresample.kd_tree import resample_nearest
 
+import pyproj
+
 import os
 import boto3
 import time
 
-# Use boto3 to grab the working credentials
-session = boto3.Session()
-creds = session.get_credentials()
+import icechunk
 
-if creds:
-    frozen_creds = creds.get_frozen_credentials()
-    os.environ["AWS_ACCESS_KEY_ID"] = frozen_creds.access_key
-    os.environ["AWS_SECRET_ACCESS_KEY"] = frozen_creds.secret_key
-    if frozen_creds.token:
-        os.environ["AWS_SESSION_TOKEN"] = frozen_creds.token
-        
-    # Prevent obstore from trying to hit the EC2 metadata endpoint
-    os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
-    
-    print("Successfully injected boto3 credentials into environment for obstore.")
-else:
-    print("Warning: boto3 could not find AWS credentials.")
+import earthaccess
+import numpy as np
+import logging
+
+log = logging.getLogger(__name__)
+
+# Constants for VIIRS HDF-EOS5 Structure
+_HDFEOS_DATA_PATH = "HDFEOS/GRIDS/VIIRS_Grid_IMG_2D/Data Fields/CGF_NDSI_Snow_Cover"
+_HDFEOS_XDIM_PATH = "HDFEOS/GRIDS/VIIRS_Grid_IMG_2D/XDim"
+_HDFEOS_YDIM_PATH = "HDFEOS/GRIDS/VIIRS_Grid_IMG_2D/YDim"
+
+# Standard MODIS/VIIRS Sinusoidal projection definition
+_SIN_CRS = (
+    "+proj=sinu +lon_0=0 +x_0=0 +y_0=0 "
+    "+a=6371007.181 +b=6371007.181 +units=m +no_defs"
+)
+
+# Silence icechunk rust warnings. Must be set before importing icechunk.
+os.environ.setdefault("RUST_LOG", "error")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,6 +106,35 @@ log = logging.getLogger(__name__)
 AMSR2_GLOB = "**/*.h5"
 CEDA_GLOB = "**/*.nc"
 VIIRS_GLOB = "**/*.h5"
+
+# AMSR2 Icechunk constants
+GPORTAL_URL = "https://gportal.jaxa.jp/"
+CEDA_URL = "https://dap.ceda.ac.uk/"
+
+import boto3
+import os
+
+def refresh_aws_credentials():
+    """Fetches fresh credentials from the boto3 session and injects them into the environment."""
+    log.info("Refreshing AWS credentials...")
+    session = boto3.Session()
+    creds = session.get_credentials()
+    
+    if creds:
+        # get_frozen_credentials() forces a refresh if the current ones are expired
+        frozen_creds = creds.get_frozen_credentials()
+        os.environ["AWS_ACCESS_KEY_ID"] = frozen_creds.access_key
+        os.environ["AWS_SECRET_ACCESS_KEY"] = frozen_creds.secret_key
+        if frozen_creds.token:
+            os.environ["AWS_SESSION_TOKEN"] = frozen_creds.token
+            
+        os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+        log.info("Successfully refreshed and injected AWS credentials.")
+    else:
+        log.warning("Warning: boto3 could not find AWS credentials to refresh.")
+
+# Call it once at initialization
+refresh_aws_credentials()
 
 
 # ── path helpers ──────────────────────────────────────────────────────────────
@@ -143,44 +175,80 @@ def _regrid_amsr2(
     overwrite_weights: bool = False,
     fs=None,
 ) -> dict[str, xr.DataArray]:
-    """Regrid the first matching AMSR2 file found and return {var_name: DataArray}."""
-   
-    # Format the date to match how it appears in your filenames
-    # Example format: "20190101"
-    date_str = current_date.strftime("%Y%m%d") 
-
-    all_files = _list_files(input_dir, ".h5", fs=fs)
-    # Filter for files that belong to this specific date
-    files = [f for f in all_files if "01D" in f and "EQMD" in f and date_str in f]
+    """Regrid AMSR2 data from Icechunk store and return {var_name: DataArray}."""
+     
+    # The Icechunk store is accessed via Repository.open with S3 storage
+    log.info(f"AMSR2: Opening Icechunk repository from S3...")
     
-    if not files:
-        log.warning("No daily descending AMSR2 files found — skipping")
-        return {}
+    try:
+        # Open the Icechunk repository using the proper API
+        repo = icechunk.Repository.open(
+            icechunk.s3_storage(
+                bucket="airborne-smce-prod-user-bucket",
+                prefix="JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND",
+                from_env=True  # Force dynamic credential refresh
+            ),
+            authorize_virtual_chunk_access={GPORTAL_URL: icechunk.credentials.HttpAccess},
+        )
+        log.info("AMSR2: Successfully opened Icechunk repository")
         
-    path = files[0]
-    log.info("AMSR2: using %s", _path_name(path))
-
-    if _is_s3(path):
-        handler = handler_from_s3(Amsr2FileHandler, path, fs=fs)
-    else:
-        handler = Amsr2FileHandler.from_path(path)
-
-    # 1. Load dataset, rename dimensions
-    da = handler.get_dataset().rename({"y": "lat", "x": "lon"})
+        # Open a read-only session
+        session = repo.readonly_session("main")
+        
+        # Open the dataset with xarray
+        ds_full = xr.open_zarr(session.store)
+        log.info(f"AMSR2 Icechunk store opened successfully. Available variables: {list(ds_full.data_vars)}")
+        
+    except Exception as e:
+        log.error(f"Failed to open AMSR2 Icechunk store: {e}")
+        return {}
     
-    # Strictly attach the physical coordinates from the handler
-    da = da.assign_coords(lat=handler._lat, lon=handler._lon)
+    # Select data for the current date using boolean indexing (time may not be sorted)
+    date_str = current_date.strftime("%Y-%m-%d")
+    try:
+        times = pd.DatetimeIndex(pd.to_datetime(ds_full["time"].values))
+        mask = (times >= pd.Timestamp(date_str)) & (times <= pd.Timestamp(date_str))
+        matching_indices = np.flatnonzero(mask)
+        
+        if len(matching_indices) == 0:
+            log.warning(f"AMSR2: No data found for {date_str}")
+            return {}
+            
+        ds_day = ds_full.isel(time=matching_indices[0])
+        log.info(f"AMSR2: Selected data for {date_str}")
+    except Exception as e:
+        log.warning(f"AMSR2: Error selecting data for {date_str}: {e}")
+        return {}
     
-    # 2. Convert from 0-360 to -180-180 and physically rotate the data matrix natively
-    log.info("Converting AMSR2 longitudes from 0-360 to -180 to 180 and sorting matrix...")
+    # Extract the geophysical_data variable
+    # Structure: (time, orbit, lat, lon, band)
+    # We want orbit="Descending" and band="snow_depth"
+    try:
+        # Select descending orbit and snow_depth band
+        da = ds_day["geophysical_data"].sel(orbit="Descending", band="snow_depth")
+        
+        # Apply scale factor (data is stored as int16, needs to be scaled to cm)
+        scale_factor = ds_day["geophysical_data"].attrs.get("scale_factor", 0.1)
+        da = da.astype(np.float32) * scale_factor
+        
+        # Convert from cm to mm for consistency with other datasets
+        da = da * 10.0
+        
+        log.info(f"AMSR2: Extracted snow depth data with shape {da.shape}")
+    except Exception as e:
+        log.error(f"AMSR2: Error extracting geophysical_data: {e}")
+        return {}
     
-    # Standard xarray math to convert 0-360 coordinates to -180-180
-    da = da.assign_coords(lon=(((da.lon + 180) % 360) - 180))
+    # Ensure lat/lon coordinates are attached
+    if 'lat' in ds_day.coords and 'lon' in ds_day.coords:
+        da = da.assign_coords(lat=ds_day['lat'], lon=ds_day['lon'])
     
-    # Tell xarray to physically reorder the underlying data matrix to match the new coordinates!
-    # This automatically shifts the -180 data to the left and +180 data to the right.
-    da = da.sortby("lon")   
-
+    # Convert from 0-360 to -180-180 if necessary
+    if 'lon' in da.coords and da.lon.max() > 180:
+        log.info("Converting AMSR2 longitudes from 0-360 to -180 to 180 and sorting matrix...")
+        da = da.assign_coords(lon=(((da.lon + 180) % 360) - 180))
+        da = da.sortby("lon")
+    
     # =========================================================================
     # Ensure LIS grid has lat/lon officially set as coordinates
     # =========================================================================
@@ -226,9 +294,7 @@ def _regrid_amsr2(
                 
             if vmax is not None:
                 plot_kwargs['vmax'] = vmax
-
-            print(f'vmax is {vmax}')
-                
+     
             data_array.plot.pcolormesh(**plot_kwargs)
         except Exception as e:
             log.warning(f"Could not plot {filename}: {e}")
@@ -244,155 +310,236 @@ def _regrid_amsr2(
         plt.close(fig)
     # -----------------------------
 
-    # Extract native data array, but don't plot it just yet
-    da_mean_native = da.isel(inner=0).drop_vars("inner", errors="ignore")
-
-    # 4. Create source grid EXACTLY from our native coordinates
+    # Create source grid from native coordinates
     source_grid = xr.Dataset(coords={"lat": da.lat, "lon": da.lon})
 
-    # 5. Compute weights and initialize regridder (Static File)
+    # Compute weights and initialize regridder
     weights_local_dir = _ensure_local_dir(weights_dir)
     weights_path = weights_local_dir / f"amsr2-lis-weights-{method}.nc"
     
-    # This will naturally skip computing if the file exists and overwrite_weights=False
     compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
-    #compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=True)
     regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
-    # 6. Extract the data and apply the regridder
-    ds_mean = da.isel(inner=0).drop_vars("inner", errors="ignore").to_dataset(name="Geophysical Data")
-    ds_unc  = da.isel(inner=1).drop_vars("inner", errors="ignore").to_dataset(name="Geophysical Data")
-
-    # Quick diagnostic: does the native data even have values here?
-    valid_native = np.count_nonzero(~np.isnan(ds_mean["Geophysical Data"].values))
+    # Prepare datasets for regridding
+    ds_mean = da.to_dataset(name="snow_depth")
+    
+    # Quick diagnostic
+    valid_native = np.count_nonzero(~np.isnan(ds_mean["snow_depth"].values))
     log.info(f"AMSR2 native matrix has {valid_native} valid pixels before regridding.")
 
-    log.info("AMSR2: regridding mean (inner=0) …")
-    rg_mean = regridder(ds_mean)["Geophysical Data"]
+    # Rechunk to a single large chunk to avoid chunk multiplication warnings
+    log.info("AMSR2: rechunking data to single chunk for regridding...")
+    ds_mean = ds_mean.chunk({"lat": -1, "lon": -1})
+
+    log.info("AMSR2: regridding snow depth...")
+    rg_mean = regridder(ds_mean)["snow_depth"]
     
-    # Re-attach LIS coordinates to the output array for accurate map plotting
+    # Re-attach LIS coordinates
     rg_mean = rg_mean.assign_coords(lat=lis_grid.lat, lon=lis_grid.lon)
 
-    # Find the max value from the regridded data to match colorbars
+    # Find the max value for plotting
     plot_vmax = float(np.nanmax(rg_mean.values))
     log.info(f"Setting plot colorbar maximum to {plot_vmax:.2f}")
 
-    # PLOT 1 (Delayed): Native Data using the regridded max value
-    da_plot_native = da_mean_native.sortby("lon")
-    
-    _debug_plot(da_plot_native, "AMSR2 Native Grid (Central U.S.)", "amsr2_01_native.png", extents=lis_extents, vmax=plot_vmax)
+    # Generate debug plots
+    da_plot_native = da.sortby("lon")
+#    _debug_plot(da_plot_native, "AMSR2 Native Grid (Central U.S.)", "amsr2_01_native.png", extents=lis_extents, vmax=plot_vmax)
+#    _debug_plot(rg_mean, "AMSR2 Regridded (Central U.S.)", "amsr2_03_regridded.png", extents=lis_extents, vmax=plot_vmax)
 
-    # PLOT 3: Final Regridded map
-    _debug_plot(rg_mean, "AMSR2 Regridded (Central U.S.)", "amsr2_03_regridded.png", extents=lis_extents, vmax=plot_vmax)
-
-    log.info("AMSR2: regridding uncertainty (inner=1) …")
-    rg_unc  = regridder(ds_unc)["Geophysical Data"]
-
-    def _da(arr, long_name, units):
-        return xr.DataArray(
-            arr.values.astype(np.float32),
+    result = {
+        "amsr2_snow_depth_mean": xr.DataArray(
+            rg_mean.values.astype(np.float32),
             dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
+            attrs={
+                "long_name": "AMSR2 snow depth (daily descending-pass mean)",
+                "units": "mm",
+                "source": "s3://airborne-smce-prod-user-bucket/JOIN/icechunk-stores/GCOM-W1-AMSR2-L3-SND"
+            },
         )
-
-    return {
-        "amsr2_snow_depth_mean": _da(
-            rg_mean,
-            "AMSR2 snow depth (daily descending-pass mean)",
-            "mm",
-        ),
-        "amsr2_snow_depth_uncertainty": _da(
-            rg_unc,
-            "AMSR2 snow depth uncertainty (daily descending-pass value)",
-            "mm",
-        ),
     }
+
+    return result
     
+
 def _regrid_ceda(
-    input_dir: str,
-    lis_grid: xr.Dataset,
-    method: str,
-    weights_dir: str,    
-    current_date: pd.Timestamp,
-    overwrite_weights: bool = False,    
-    fs=None,
-) -> dict[str, xr.DataArray]:
-    """Regrid the file found and return {var_name: DataArray}."""
-    # Format the date to match how it appears in your filenames
-    # Example format: "20190101"
-    date_str = current_date.strftime("%Y%m%d") 
-    
-    all_files = _list_files(input_dir, ".nc", fs=fs)
-    if not all_files:
-        log.warning("No CEDA files found under %s — skipping", input_dir)
+    ceda_dir,
+    lis_grid,
+    method,
+    weights_dir,
+    current_date,
+    overwrite_weights=False,
+    fs=None
+) -> dict:
+    """
+    Regrid CEDA SWE data using the Icechunk virtual Zarr V3 store.
+    Includes regional plotting zoomed into the provided LIS grid extents.
+    """
+    date_str = current_date.strftime("%Y-%m-%d")
+    log.info(f"Starting CEDA processing for {date_str}...")
+
+    # Calculate LIS extents for zoomed-in plotting
+    min_lon, max_lon = lis_grid.lon.min().item(), lis_grid.lon.max().item()
+    min_lat, max_lat = lis_grid.lat.min().item(), lis_grid.lat.max().item()
+    lis_extents = [min_lon - 2, max_lon + 2, min_lat - 2, max_lat + 2]
+
+    # ==========================================
+    # 1. Connect to Icechunk Store
+    # ==========================================
+    bucket = "airborne-smce-prod-user-bucket"
+    prefix = "JOIN/icechunk-stores/CEDA_Store_v3/"
+    base_ceda_url = "https://dap.ceda.ac.uk/neodc/esacci/snow/data/swe/MERGED/v4.0/"
+
+    try:
+        storage = icechunk.s3_storage(bucket=bucket, prefix=prefix)
+        config = icechunk.RepositoryConfig.default()
+        container = icechunk.VirtualChunkContainer(
+            name="ceda_archive",       
+            url_prefix=base_ceda_url,  
+            store=icechunk.http_store()
+        )
+        config.set_virtual_chunk_container(container)
+
+        repo = icechunk.Repository.open(
+            storage=icechunk.s3_storage(
+                bucket=bucket, 
+                prefix=prefix, 
+                from_env=True  # Force dynamic credential refresh
+            ),
+            config=config,
+            authorize_virtual_chunk_access={base_ceda_url: icechunk.credentials.HttpAccess}
+        )
+        
+        # repo = icechunk.Repository.open(
+        #     storage=storage,
+        #     config=config,
+        #     authorize_virtual_chunk_access={base_ceda_url: icechunk.credentials.HttpAccess}
+        # )
+        session = repo.readonly_session("main")
+        
+        # Open virtual dataset 
+        ds_full = xr.open_zarr(session.store, zarr_format=3)
+    except Exception as e:
+        log.error(f"Failed to open CEDA Icechunk store: {e}")
         return {}
 
-    files = [f for f in all_files if date_str in f]
+    # ==========================================
+    # 2. Select Data for Current Date
+    # ==========================================
+    try:
+        # .squeeze() removes the time dimension leaving 2D (lat, lon) arrays
+        swe_day = ds_full['swe'].sel(time=date_str).squeeze()
+        
+        # If the dataset has swe_std, grab it too. Otherwise fallback to empty/NaN.
+        if 'swe_std' in ds_full:
+            swe_std_day = ds_full['swe_std'].sel(time=date_str).squeeze()
+        else:
+            swe_std_day = xr.full_like(swe_day, np.nan)
+            
+        ds_ceda = xr.Dataset({"swe": swe_day, "swe_std": swe_std_day})
+    except KeyError:
+        log.warning(f"CEDA: No data found for {date_str}")
+        return {}
+    except Exception as e:
+        log.error(f"CEDA: Error selecting data for {date_str}: {e}")
+        return {}
+
+    valid_native_swe = np.count_nonzero(~np.isnan(ds_ceda["swe"].values))
+    log.info(f"CEDA native matrix has {valid_native_swe} valid pixels before regridding.")
+    if valid_native_swe == 0:
+        log.warning(f"CEDA: Found file but no valid SWE data for {date_str}.")
+        return {}
+
+    # ==========================================
+    # 3. Generate Diagnostic Plot (Zoomed to LIS)
+    # ==========================================
+    log.info("Generating regional CEDA plot (fetching byte-ranges via HTTPS)...")
+    Path("./plot").mkdir(parents=True, exist_ok=True)
     
-    path = files[0]
-    log.info("CEDA: using %s", _path_name(path))
+    # We use PlateCarree since we are zooming into a specific rectangular boundary
+    fig, ax = plt.subplots(figsize=(10, 6), subplot_kw={'projection': ccrs.PlateCarree()})
+    
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.5, linestyle=':')
+    ax.add_feature(cfeature.STATES, linewidth=0.3, linestyle=':')
+    ax.gridlines(draw_labels=True, alpha=0.3, color='gray', linestyle='--')
 
-    if _is_s3(path):
-        handler = handler_from_s3(CedaFileHandler, path, fs=fs)
-    else:
-        handler = CedaFileHandler.from_path(path)
+    # Zoom into the LIS domain extents
+    ax.set_extent(lis_extents, crs=ccrs.PlateCarree())
 
-    ds = handler.get_dataset()
+    try:
+        ds_ceda['swe'].plot(
+            ax=ax, 
+            transform=ccrs.PlateCarree(),
+            cmap='Blues',           
+            vmin=0,                 
+            cbar_kwargs={
+                'label': 'Snow Water Equivalent (mm)', 
+                'shrink': 0.7, 
+                'orientation': 'vertical'
+            }
+        )
+        ax.set_title(f"ESA CCI Snow Water Equivalent (SWE) - {date_str}\n(LIS Domain)", fontsize=14, pad=10)
+        plt.tight_layout()
+        
+        output_filename = f"./plot/swe_lis_domain_{date_str.replace('-', '')}.png"
+        plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+        log.info(f"Plot saved to {output_filename}")
+    except Exception as e:
+        log.warning(f"Could not generate plot for {date_str}: {e}")
+    finally:
+        plt.close(fig)
 
-    lat_vals = ds["lat"].values if "lat" in ds else ds["y"].values
-    lon_vals = ds["lon"].values if "lon" in ds else ds["x"].values
-    if lat_vals.ndim == 2:
-        lat_vals = lat_vals[:, 0]
-    if lon_vals.ndim == 2:
-        lon_vals = lon_vals[0, :]
-    source_grid = xr.Dataset(
-        coords={"lat": np.sort(np.unique(lat_vals)), "lon": np.sort(np.unique(lon_vals))}
-    )
+    # ==========================================
+    # 4. Regridding to LIS Grid
+    # ==========================================
+    # Define native source coordinates
+    source_grid = xr.Dataset(coords={"lat": ds_ceda.lat, "lon": ds_ceda.lon})
 
     weights_local_dir = _ensure_local_dir(weights_dir)
     weights_path = weights_local_dir / f"ceda-lis-weights-{method}.nc"
-    compute_weights(source_grid, lis_grid, weights_path, method=method, overwrite=overwrite_weights)
-    regridder = load_regridder(source_grid, lis_grid, weights_path, method=method)
 
-    # Restore lat/lon as dim names for xESMF
-    ds_xesmf = ds.swap_dims({"y": "lat", "x": "lon"})
+    # Compute weights and load xESMF regridder
+    compute_weights(
+        source_grid,
+        lis_grid,
+        weights_path,
+        method=method,
+        overwrite=overwrite_weights,
+    )
+    regridder = load_regridder(
+        source_grid,
+        lis_grid,
+        weights_path,
+        method=method,
+    )
 
-    log.info("CEDA: regridding swe and swe_std …")
-    rg = regridder(ds_xesmf)
+    log.info("CEDA: rechunking data to single chunks for regridding...")
+    ds_ceda = ds_ceda.chunk({"lat": -1, "lon": -1})
 
-    def _da(arr, long_name, units):
-        return xr.DataArray(
-            arr.values.astype(np.float32),
-            dims=["north_south", "east_west"],
-            attrs={"long_name": long_name, "units": units, "source": _path_name(path)},
-        )
+    log.info("CEDA: regridding swe and swe_std...")
+    rg = regridder(ds_ceda)
 
     return {
-        "ceda_swe": _da(rg["swe"], "CEDA ESA CCI snow water equivalent", "mm"),
-        "ceda_swe_std": _da(rg["swe_std"], "CEDA ESA CCI SWE standard deviation", "mm"),
+        "ceda_swe": xr.DataArray(
+            rg["swe"].values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={
+                "long_name": "CEDA ESA CCI snow water equivalent",
+                "units": "mm",
+                "source": f"s3://{bucket}/{prefix}",
+            },
+        ),
+        "ceda_swe_std": xr.DataArray(
+            rg["swe_std"].values.astype(np.float32),
+            dims=["north_south", "east_west"],
+            attrs={
+                "long_name": "CEDA ESA CCI SWE standard deviation",
+                "units": "mm",
+                "source": f"s3://{bucket}/{prefix}",
+            },
+        ),
     }
 
-
-# def _viirs_tile_bbox(h: int, v: int) -> tuple[float, float, float, float]:
-#     """Return (lon_min, lat_min, lon_max, lat_max) for a MODIS/VIIRS h/v tile.
-
-#     The MODIS sinusoidal tile grid divides the globe into 36 × 18 tiles.
-#     Each tile spans exactly 10° of latitude and ~10° equivalent in the
-#     sinusoidal projection.  Tile (h=0, v=0) is the top-left (north-west) tile.
-#     """
-#     lat_max = 90.0 - v * 10.0
-#     lat_min = lat_max - 10.0
-#     # Longitude extent depends on latitude; use the wider of top/bottom edge
-#     # sin-projection x-extent per tile is (2*pi*R/36) metres, but for bbox
-#     # purposes we just use the geographic span at each latitude edge.
-#     import math
-#     def _lon_half_width(lat_deg):
-#         lat_r = math.radians(abs(lat_deg))
-#         cos_lat = math.cos(lat_r) if lat_r < math.pi / 2 else 1e-9
-#         return 10.0 / cos_lat  # degrees longitude for 10° equivalent arc
-#     hw = max(_lon_half_width(lat_min), _lon_half_width(lat_max))
-#     lon_centre = -180.0 + (h + 0.5) * (360.0 / 36.0)
-#     return lon_centre - hw, lat_min, lon_centre + hw, lat_max
 
 def _viirs_tile_bbox(h: int, v: int) -> tuple[float, float, float, float]:
     """
@@ -443,307 +590,169 @@ def _viirs_tile_overlaps_area(h: int, v: int, area) -> bool:
                 lat_max < a_lat_min or lat_min > a_lat_max)
 
 
+
+
 def _regrid_viirs(
-    input_dir: str,
-    lis_area,
-    method: str,
-    current_date: pd.Timestamp,
-    fs=None,    
-    max_tiles: int | None = None,
-) -> dict[str, xr.DataArray]:
-    """Regrid the first VIIRS date group found and return {var_name: DataArray}."""
-    from pyresample.geometry import SwathDefinition
+    lis_grid, 
+    method: str, 
+    current_date, 
+    max_tiles: int = None,
+    **kwargs
+) -> dict:
+    
+    date_str = current_date.strftime("%Y-%m-%d")
+    log.info(f"Starting VIIRS processing for {date_str} via Earthdata...")
 
-    # Format the date to match how it appears in your filenames
-    # Example format: "20190101"
-    date_str = current_date.strftime("%Y%j") 
-    path_str = current_date.strftime("%Y/%m/%d/")
+    # 1. Calculate bounding box for Earthdata search
+    try:
+        if hasattr(lis_grid, 'get_lonlats'):
+            lons, lats = lis_grid.get_lonlats()
+            min_lon, max_lon = float(lons.min()), float(lons.max())
+            min_lat, max_lat = float(lats.min()), float(lats.max())
+        else:
+            min_lon = float(lis_grid.lon.min().item())
+            max_lon = float(lis_grid.lon.max().item())
+            min_lat = float(lis_grid.lat.min().item())
+            max_lat = float(lis_grid.lat.max().item())
+    except Exception as e:
+        log.warning(f"Could not extract bounding box from lis_grid: {e}. Falling back to default region.")
+        min_lon, min_lat, max_lon, max_lat = -116.1, 35.32, -89.46, 50.59
+        
+    bounding_box = (min_lon, min_lat, max_lon, max_lat)
+
+    # 2. Search for the granules directly via Earthdata
+    short_name = "VJ110A1F"
+    log.info(f"Searching Earthdata for {short_name} granules on {date_str} within bounding box {bounding_box}...")
     
-    input_dir = f"{input_dir}VJ110A1F/{path_str}"
-    all_files = _list_files(input_dir, ".h5", fs=fs)
-    # Remove duplicates from the entire directory search
-    all_files = list(dict.fromkeys(all_files))
-    
-    if not all_files:
-        log.warning("No VIIRS files found under %s — skipping", input_dir)
+    raw_results = earthaccess.search_data(
+        short_name=short_name,
+        bounding_box=bounding_box,
+        temporal=(date_str, date_str)   
+    )
+
+    if not raw_results:
+        log.warning(f"No VIIRS granules found for {date_str}. Skipping VIIRS processing.")
         return {}
-    # Filter for files that belong to this specific date
-    files = [f for f in all_files if date_str in f]
-    
-    date_groups: dict[str, list[str]] = defaultdict(list)
-    for p in files:
-        stem = _path_name(p).rsplit(".", 1)[0] if "." in _path_name(p) else _path_name(p)
-        parts = stem.split(".")
-        date_key = parts[1] if len(parts) > 1 else stem
-        date_groups[date_key].append(p)
 
-    date_key, paths = next(iter(sorted(date_groups.items())))
-
-    # Filter to tiles that spatially overlap the LIS domain
-    filtered = []
+    # 2.5 Filter to tiles that spatially overlap the LIS domain exactly
+    import re
+    results = []
     skipped = 0
-    for p in paths:
-        fname = _path_name(p)
-        m = __import__("re").search(r"\.h(\d{2})v(\d{2})\.", fname)
+    
+    for granule in raw_results:
+        # The filename is usually stored in the data links or URIs
+        links = granule.data_links()
+        if not links:
+            continue
+            
+        fname = links[0].split('/')[-1]
+        m = re.search(r"\.h(\d{2})v(\d{2})\.", fname)
+        
         if m is not None:
             h, v = int(m.group(1)), int(m.group(2))
-            if not _viirs_tile_overlaps_area(h, v, lis_area):
+            lis_area_obj = getattr(lis_grid, "area", lis_grid)
+            
+            # Use your existing overlap check function
+            if not _viirs_tile_overlaps_area(h, v, lis_area_obj):
                 skipped += 1
                 continue
-        filtered.append(p)
+                
+        results.append(granule)
+
     if skipped:
-        log.info("VIIRS: skipped %d tile(s) outside LIS domain bbox", skipped)
-    paths = filtered
-    if not paths:
+        log.info(f"VIIRS: skipped {skipped} tile(s) outside precise LIS domain AreaDefinition")
+
+    if not results:
         log.warning("VIIRS: no tiles overlap the LIS domain — skipping")
         return {}
-    if max_tiles is not None and len(paths) > max_tiles:
+
+    num_granules = len(results)
+    log.info(f"VIIRS: using date {date_str} ({num_granules} tile(s))")
+
+    if max_tiles is not None and num_granules > max_tiles:
         raise RuntimeError(
-            f"VIIRS: {len(paths)} tile(s) would be loaded but --max-viirs-tiles={max_tiles}. "
+            f"VIIRS: {num_granules} tile(s) would be loaded but --max-viirs-tiles={max_tiles}. "
             "Aborting to prevent OOM. Either the spatial filter is not working correctly "
             "or the domain is unusually large. Increase --max-viirs-tiles only if expected."
         )
-    log.info("VIIRS: using date %s (%d tile(s))", date_key, len(paths))
 
-    all_data, all_lons, all_lats = [], [], []
-    for path in paths:
-        if _is_s3(path):
-            handler = handler_from_s3(ViirsFileHandler, path, fs=fs)
-        else:
-            handler = ViirsFileHandler.from_path(path)
-        da = handler.get_dataset()
-        swath_def = da.attrs["area"]
-        all_data.append(da.values)
-        all_lons.append(swath_def.lons.values)
-        all_lats.append(swath_def.lats.values)
+    # 3. Stream data directly
+    try:
+        log.info("Opening files directly via Earthdata S3 streaming...")
+        file_objects = earthaccess.open(results)
+    except Exception as e:
+        log.error(f"Failed to open stream for VIIRS granules: {e}")
+        return {}
 
-    composite_data = np.concatenate(all_data, axis=0)
-    composite_lons = np.concatenate(all_lons, axis=0)
-    composite_lats = np.concatenate(all_lats, axis=0)
+    # Setup the projection transformer once
+    transformer = pyproj.Transformer.from_crs(_SIN_CRS, "EPSG:4326", always_xy=True)
 
-    lons_da = xr.DataArray(composite_lons, dims=["y", "x"])
-    lats_da = xr.DataArray(composite_lats, dims=["y", "x"])
-    source_def = SwathDefinition(lons=lons_da, lats=lats_da)
-    composite_da = xr.DataArray(composite_data, dims=["y", "x"])
+    # 4. Initialize an empty accumulator array sized to our target LIS grid
+    lis_area_obj = getattr(lis_grid, "area", lis_grid)
+    target_shape = lis_area_obj.shape
+    combined_snow = np.full(target_shape, np.nan, dtype=np.float32)
 
-    log.info("VIIRS: regridding with method=%s …", method)
-    rg = regrid(composite_da, source_def, lis_area, method=method)
+    # 5. Process Tile-by-Tile (Strict Memory Bounding)
+    log.info("Processing and regridding VIIRS tiles sequentially to conserve memory...")
+    
+    for i, file_obj in enumerate(file_objects):
+        try:
+            # A. Stream and extract just this tile
+            with h5py.File(file_obj, "r") as f:
+                raw = f[_HDFEOS_DATA_PATH][:]
+                x_coords = f[_HDFEOS_XDIM_PATH][:]
+                y_coords = f[_HDFEOS_YDIM_PATH][:]
 
-    return {
+            data = raw.astype(np.float32)
+            data[data > 100] = np.nan
+
+            # Optimization: If the tile is completely empty, skip pyresample entirely
+            if np.all(np.isnan(data)):
+                continue
+
+            # B. Calculate coords for this tile only
+            x2d, y2d = np.meshgrid(x_coords, y_coords)
+            lon2d, lat2d = transformer.transform(x2d, y2d)
+
+            source_def = SwathDefinition(
+                lons=xr.DataArray(lon2d, dims=["y", "x"]), 
+                lats=xr.DataArray(lat2d, dims=["y", "x"])
+            )
+            
+            da_snow = xr.DataArray(data, dims=["y", "x"])
+            da_snow.attrs["area"] = source_def
+
+            # C. Regrid just this tile
+            log.info(f"  -> Regridding tile {i+1}/{len(file_objects)}...")
+            rg_tile = regrid(da_snow, source_def, lis_area_obj, method=method)
+
+            # D. Accumulate into the master LIS array
+            # Where the tile has valid data, write it into the combined array
+            tile_data = rg_tile.values
+            valid_mask = ~np.isnan(tile_data)
+            combined_snow[valid_mask] = tile_data[valid_mask]
+            
+            # E. Memory cleanup (variables overwritten in next loop, file stream closed)
+        except Exception as e:
+            log.warning(f"Could not load or regrid VIIRS granule {i+1}: {e}")
+        finally:
+            file_obj.close()
+
+    # 6. Format output mapping
+    result = {
         "viirs_cgf_ndsi_snow_cover": xr.DataArray(
-            rg.values.astype(np.float32),
+            combined_snow,
             dims=["north_south", "east_west"],
             attrs={
-                "long_name": "VIIRS CGF NDSI snow cover",
-                "units": "1",
-                "source": f"date_key={date_key}",
+                "long_name": "VIIRS Cloud Gap Filled NDSI Snow Cover",
+                "units": "percentage",
+                "source": "NASA Earthdata (VJ110A1F via earthaccess)",
             },
         )
     }
-
-# def _regrid_icesat2(
-#     parquet_path: str,
-#     lis_area,
-#     lis_grid: xr.Dataset,
-#     fs=None,
-# ) -> dict[str, xr.DataArray]:
-#     """Regrid ICESat-2 ATL06 point cloud and return {var_name: DataArray}.
-
-#     For S3 URIs, the path is passed directly to geopandas.read_parquet which
-#     delegates to pyarrow's native S3 support (no FSFile wrapper needed).
-#     For local paths, existence is checked before proceeding.
-#     """
-#     if not _is_s3(parquet_path) and not Path(parquet_path).exists():
-#         log.warning("ICESat-2 Parquet not found at %s — skipping", parquet_path)
-#         return {}
-#     # Icesat2FileHandler.get_dataset calls geopandas.read_parquet(str(self.filename))
-#     # which supports s3:// URIs natively via pyarrow, so from_path without fs works.
-#     handler = Icesat2FileHandler.from_path(parquet_path)
-
-#     log.info("ICESat-2: loading from %s", parquet_path)
-#     da = handler.get_dataset()
-#     source_area = da.attrs["area"]
-#     log.info("ICESat-2: regridding %d observations using mean …", len(da))
-#     rg = regrid(da, source_area, lis_area, method="mean")
-#     return {
-#         "icesat2_h_li": xr.DataArray(
-#             rg.values.astype(np.float32),
-#             dims=["north_south", "east_west"],
-#             attrs={
-#                 "long_name": "ICESat-2 ATL06 land-ice surface height (mean per LIS pixel)",
-#                 "units": "meters",
-#                 "source": _path_name(parquet_path),
-#             },
-#         )
-#     }
-
-# def _regrid_icesat2(
-#     # parquet_path: str,
-#     da_full: xr.DataArray,
-#     lis_area,
-#     lis_grid: xr.Dataset,
-#     current_date: pd.Timestamp,
-#     source_path: str,
-#     fs=None,
-# ) -> dict[str, xr.DataArray]:
-#     """Regrid ICESat-2 ATL06 data (attempts to compute h_li - 3DEP DEM)."""
-#     import xarray as xr
-#     import numpy as np
-#     from pathlib import Path
-
-#     print(da_full)
-
-#     date_str = current_date.strftime('%Y-%m-%d')
-#     start_of_day = f"{date_str} 00:00:00"
-#     end_of_day = f"{date_str} 23:59:59"
     
-#     # Slice the dataset for the entire 24-hour period of the current date
-#     try:
-#         da = da_full.sel(time=slice(start_of_day, end_of_day))
-#     except KeyError:
-#         log.warning(f"ICESat-2: 'time' dimension missing or invalid.")
-#         return {}
-        
-#     # If the slice is empty, skip
-#     if da.size == 0:
-#         log.info(f"ICESat-2: No data points found for {date_str}")
-#         return {}
-
-#     log.info(f"ICESat-2: Found {da.size} points for {date_str}")
-
-#     source_area = da.attrs["area"]
-#     lons = source_area.lons.values
-#     lats = source_area.lats.values
-#     h_li = da.values
-
-#     # --- 1. FILTER POINTS TO LIS BOUNDING BOX ---
-#     import math as _math
-#     corners = lis_area.outer_boundary_corners
-#     corner_lons = [_math.degrees(c.lon) for c in corners]
-#     corner_lats = [_math.degrees(c.lat) for c in corners]
-    
-#     lon_min, lon_max = min(corner_lons) - 0.1, max(corner_lons) + 0.1
-#     lat_min, lat_max = min(corner_lats) - 0.1, max(corner_lats) + 0.1
-    
-#     log.info("Filtering ICESat-2 points to LIS domain: Lon [%.2f, %.2f], Lat [%.2f, %.2f]", lon_min, lon_max, lat_min, lat_max)
-    
-#     domain_mask = (lons >= lon_min) & (lons <= lon_max) & (lats >= lat_min) & (lats <= lat_max)
-#     points_in_domain = np.sum(domain_mask)
-    
-#     log.info("Found %d of %d points inside LIS domain", points_in_domain, len(lons))
-    
-#     # Start with h_li as our baseline
-#     final_values = h_li.copy()
-
-#     # --- 2. ATTEMPT SLIDERULE 3DEP DEM EXTRACTION ---
-#     sliderule_success = False
-#     if points_in_domain > 0:
-#         log.info("Initializing SlideRule for 3DEP DEM extraction...")
-#         from sliderule import icesat2, raster
-#         import time
-#         import pandas as pd
-        
-#         try:
-#             icesat2.init("slideruleearth.io", verbose=False)
-            
-#             # 1. Vectorized filtering and coordinate generation
-#             filtered_lons = lons[domain_mask]
-#             filtered_lats = lats[domain_mask]
-            
-#             # np.column_stack is significantly faster than zip + list comprehension
-#             coords_array = np.column_stack((filtered_lons, filtered_lats))
-#             total_points = len(coords_array)
-            
-#             chunk_size = 50000
-            
-#             # 2. Pre-allocate NumPy array to avoid dynamic list resizing overhead
-#             dem_elevations = np.full(total_points, np.nan, dtype=np.float32)
-            
-#             log.info("Sampling %d points in chunks of %d using asset 'usgs3dep-10meter-dem'...", total_points, chunk_size)
-            
-#             for i in range(0, total_points, chunk_size):
-#                 end_idx = min(i + chunk_size, total_points)
-                
-#                 if (i // chunk_size) % 10 == 0:
-#                     log.info("  -> Requesting chunk %d to %d...", i, end_idx)
-                
-#                 # Convert only the current chunk to a nested Python list
-#                 chunk = coords_array[i:end_idx].tolist()
-                
-#                 # Attempt pure request without the buggy 'poly' hint
-#                 result = raster.sample("usgs3dep-10meter-dem", chunk)
-                
-#                 # 3. Streamlined result parsing
-#                 vals = []
-#                 if isinstance(result, pd.DataFrame) and not result.empty:
-#                     # Select the first numeric column directly
-#                     num_cols = result.select_dtypes(include=['number'])
-#                     if not num_cols.empty:
-#                         vals = num_cols.iloc[:, 0].values
-#                 elif isinstance(result, list) and result:
-#                     if isinstance(result[0], dict):
-#                         keys = list(result[0].keys())
-#                         vals = [item.get("value", item.get(keys[0], np.nan)) for item in result]
-#                     else:
-#                         vals = result
-                
-#                 # Convert extracted values to numpy array and assign to pre-allocated array
-#                 vals = np.array(vals, dtype=np.float32) if len(vals) > 0 else np.array([])
-                
-#                 # Handle size mismatches efficiently
-#                 valid_len = min(len(vals), end_idx - i)
-#                 if valid_len > 0:
-#                     dem_elevations[i : i + valid_len] = vals[:valid_len]
-                
-#                 time.sleep(0.1)
-                
-#             # Vectorized masking
-#             valid_mask = (dem_elevations > -9000) & (~np.isnan(dem_elevations))
-            
-#             if np.any(valid_mask): # Faster than np.sum(valid_mask) > 0
-#                 valid_count = np.count_nonzero(valid_mask)
-#                 log.info("Successfully fetched %d valid DEM elevations!", valid_count)
-                
-#                 # 4. Map back to the original domain efficiently
-#                 # Get the indices where domain_mask is True
-#                 domain_indices = np.where(domain_mask)[0] 
-                
-#                 # Update final_values only where we have valid DEM elevations
-#                 valid_domain_indices = domain_indices[valid_mask]
-#                 final_values[valid_domain_indices] -= dem_elevations[valid_mask]
-                
-#                 sliderule_success = True
-#             else:
-#                 log.warning("SlideRule successfully processed but returned entirely NoData (NaNs) for this region. Falling back to raw h_li.")
-                
-#         except Exception as e:
-#             log.error("SlideRule API Error: %s", e)
-#             log.warning("SlideRule failed or is offline. Falling back to raw h_li for ICESat-2.")
-
-#     # --- 3. REGRID TO LIS GRID ---
-#     da.values = final_values
-    
-#     # We only want to regrid the points that actually fall in the domain
-#     valid_points_count = points_in_domain
-    
-#     output_name = "icesat2_snow_depth" if sliderule_success else "icesat2_h_li"
-#     long_name = "ICESat-2 ATL06 Snow Depth (h_li - USGS 3DEP)" if sliderule_success else "ICESat-2 ATL06 land-ice surface height"
-    
-#     log.info("ICESat-2: regridding %d total observations (%d in domain) using mean …", len(da), valid_points_count)
-    
-#     rg = regrid(da, source_area, lis_area, method="mean")
-
-#     return {
-#         output_name: xr.DataArray(
-#             rg.values.astype(np.float32),
-#             dims=["north_south", "east_west"],
-#             attrs={
-#                 "long_name": long_name,
-#                 "units": "m",
-#                 "source": _path_name(parquet_path)
-#             },
-#         )
-#     }
+    log.info("VIIRS Earthdata streaming and regridding completed successfully.")
+    return result
 
 def _regrid_icesat2(
     df_full,  # Now taking a pandas DataFrame
@@ -927,13 +936,11 @@ def main() -> None:
     parser.add_argument("--lis-path", required=True,
                         help="Path to the LIS input NetCDF file (local or s3://).")
     parser.add_argument("--amsr2-dir", default=None,
-                        help="Directory containing AMSR2 HDF5 files (local or s3://).")
+                        help="Process AMSR2 data from Icechunk store (flag only, no path needed).")
     parser.add_argument("--ceda-dir", default=None,
                         help="Directory containing CEDA ESA CCI SWE NetCDF files (local or s3://).")
     parser.add_argument("--viirs-dir", default=None,
                         help="Directory containing VIIRS CGF snow cover HDF5 files (local or s3://).")
-    parser.add_argument("--icesat2-parquet", default=None,
-                        help="Path to the cached ICESat-2 ATL06 Parquet file (local or s3://).")
     parser.add_argument("--weights-dir", default="_data/weights",
                         help="Local directory for xESMF weights files.")
     parser.add_argument("--output-path", default="_data/swe_combined.nc",
@@ -956,10 +963,24 @@ def main() -> None:
     
     ns = parser.parse_args()
 
+    # ---------------------------------------------------------
+    # [NEW] Authenticate with NASA Earthdata Login
+    # ---------------------------------------------------------
+    log.info("Authenticating with NASA Earthdata...")
+    try:
+        # If credentials aren't in env variables or ~/.netrc, it will prompt here
+        earthaccess.login(persist=True)
+        log.info("Earthdata authentication successful.")
+    except Exception as e:
+        log.error(f"Earthdata login failed. Cannot access VIIRS data: {e}")
+        return
+    # ---------------------------------------------------------
+    
+
     # Build a shared fsspec store if any S3 paths are present
     any_s3 = any(
         _is_s3(str(p))
-        for p in [ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir, ns.icesat2_parquet]
+        for p in [ns.lis_path, ns.amsr2_dir, ns.ceda_dir, ns.viirs_dir]
         if p is not None
     )
     fs = make_fs() if any_s3 else None
@@ -968,42 +989,6 @@ def main() -> None:
     lis_grid = load_lis_grid(ns.lis_path, fs=fs)    
     lis_area = build_lis_area_definition(ns.lis_path, fs=fs, cache_dir=ns.weights_dir, overwrite=ns.overwrite_weights)
   
-    # Pre-load ICESat-2 data (if provided) to avoid reloading it on every date loop    
-    icesat2_df = None
-    if ns.icesat2_parquet is not None:
-        log.info(f"Pre-loading ICESat-2 data from {ns.icesat2_parquet}...")
-        if not _is_s3(ns.icesat2_parquet) and not Path(ns.icesat2_parquet).exists():
-            log.warning(f"ICESat-2 file not found at {ns.icesat2_parquet} — skipping ICESat-2.")
-        else:
-            try:
-                icesat2_df = pd.read_parquet(ns.icesat2_parquet)  
-                # Check what columns actually exist in the dataframe
-                log.info(f"ICESat-2 Parquet columns: {list(icesat2_df.columns)}")
-                
-                # Check if the time information is already the index
-                if icesat2_df.index.name in ['time', 'time_ns']:
-                    # Convert the index to datetime (handles both string and nanosecond integer types)
-                    icesat2_df.index = pd.to_datetime(icesat2_df.index)
-                
-                # Otherwise, check if it's a column and set it as the index
-                elif 'time_ns' in icesat2_df.columns:
-                    icesat2_df.index = pd.to_datetime(icesat2_df['time_ns'])
-                    icesat2_df.index.name = 'time_ns'
-                elif 'time' in icesat2_df.columns:
-                    icesat2_df.index = pd.to_datetime(icesat2_df['time'])
-                    icesat2_df.index.name = 'time'
-                else:
-                    log.warning("ICESat-2 data does not contain a recognizable time column/index for daily slicing.")
-
-                # SORT THE INDEX to fix the "non-monotonic" slicing error
-                if icesat2_df is not None and not icesat2_df.index.is_monotonic_increasing:
-                    log.info("Sorting ICESat-2 data by time...")
-                    icesat2_df.sort_index(inplace=True)
-        
-            except Exception as e:
-                log.error(f"Failed to read ICESat-2 parquet file: {e}")
-                icesat2_df = None
-
     # Generate a list of daily dates
     dates = pd.date_range(start=ns.start_date, end=ns.end_date, freq='D')
     
@@ -1011,6 +996,13 @@ def main() -> None:
     # MAIN TIME LOOP
     # -------------------------------------------------------------------------
     for current_date in dates:
+        # 1. Refresh global AWS credentials (boto3/os.environ)
+        refresh_aws_credentials()
+        
+        # 2. Re-instantiate the fsspec FileSystem so it picks up the fresh os.environ variables
+        if any_s3:
+            fs = make_fs()
+            
         # Use %Y%m%d to get '20190101' instead of '2019-01-01'
         date_str = current_date.strftime('%Y%m%d') 
         log.info(f"--- Processing date: {date_str} ---")     
@@ -1024,16 +1016,30 @@ def main() -> None:
             data_vars.update(_regrid_ceda(ns.ceda_dir, lis_grid, ns.ceda_method, ns.weights_dir, current_date, overwrite_weights=ns.overwrite_weights, fs=fs))
     
         if ns.viirs_dir is not None:
-            data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
+            #data_vars.update(_regrid_viirs(ns.viirs_dir, lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
+            data_vars.update(_regrid_viirs(lis_area, ns.viirs_method, current_date, fs=fs, max_tiles=ns.max_viirs_tiles))
     
-        if icesat2_df is not None:
-            icesat2_vars = _regrid_icesat2(
-                icesat2_df,
-                lis_area,
-                current_date,
-                source_path=ns.icesat2_parquet
-            )
-            data_vars.update(icesat2_vars)
+        # Load ICESat-2 data for this specific date from S3
+        icesat2_s3_path = f"s3://airborne-smce-prod-user-bucket/JOIN/ICESAT-2/ATL06_MOSAIC/{current_date.strftime('%Y/%m/%d')}/atl06_{date_str}.parquet"
+        try:
+            log.info(f"Loading ICESat-2 data from {icesat2_s3_path}...")
+            icesat2_df = pd.read_parquet(icesat2_s3_path)
+            
+            if len(icesat2_df) > 0:
+                log.info(f"ICESat-2 Parquet columns: {list(icesat2_df.columns)}")
+                icesat2_vars = _regrid_icesat2(
+                    icesat2_df,
+                    lis_area,
+                    current_date,
+                    source_path=icesat2_s3_path
+                )
+                data_vars.update(icesat2_vars)
+            else:
+                log.info(f"ICESat-2: No data points found for {date_str}")
+        except FileNotFoundError:
+            log.info(f"ICESat-2 file not found for {date_str} at {icesat2_s3_path}")
+        except Exception as e:
+            log.warning(f"Failed to load ICESat-2 data for {date_str}: {e}")
     
         # Check if we actually found any data for today
         if not data_vars:
