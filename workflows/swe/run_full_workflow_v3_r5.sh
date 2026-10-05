@@ -13,5 +13,5 @@ WEIGHTS_DIR=_data/weights/
 START_DATE=2019/01/01
 END_DATE=2019/01/01
 
-python3 full-workflow_v3_r4.py --start-date $START_DATE --end-date $END_DATE --lis-path $LIS_PATH --amsr2-dir $AMSR2_DIR --ceda-dir $CEDA_DIR --viirs-dir $VIIRS_DIR \
+python3 full-workflow_v3_r5.py --start-date $START_DATE --end-date $END_DATE --lis-path $LIS_PATH --amsr2-dir $AMSR2_DIR --ceda-dir $CEDA_DIR --viirs-dir $VIIRS_DIR \
 			       	 --weights-dir $WEIGHTS_DIR

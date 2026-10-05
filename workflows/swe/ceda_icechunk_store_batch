@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --partition=demand-8cpu-c7i
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=15GB
+#SBATCH --job-name=slurm_test
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+
+# Loads modules
+module load miniconda3
+
+# Hook conda into this non-interactive shell directly
+eval "$(conda shell.bash hook)"
+
+# activate your conda env
+conda activate dgiles-data_access
+
+# --- Date Calculation Logic ---
+START_DATE="2018-10-01"
+END_DATE="2026-07-01"
+
+# Run your python code using the dynamically calculated dates
+python /shared/users-local/dgiles/join/join-scratch/workflows/swe/create_ceda_icechunk_store.py --start $START_DATE --end $END_DATE

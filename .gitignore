@@ -2,6 +2,11 @@ workflows/swe/plot
 workflows/swe/_data
 workflows/swe/check_icesat2_mosaic.csv
 
+collected_licenses/
+dependency_licenses.csv
+gather_licenses.ipynb
+third_party_licenses.tar.gz
+
 # Quarto outputs
 docs/_site/
 docs/.quarto/

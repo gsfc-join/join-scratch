@@ -1,0 +1,22 @@
+#!/bin/bash
+#SBATCH --partition=demand-8cpu-c7i # choose from the partitions above
+#SBATCH --ntasks=1 # run one task with using all compute resources
+#SBATCH --cpus-per-task=8 # use all available cpus
+#SBATCH --mem=15GB # The memory needs to be slightly lower than the node max
+#SBATCH --job-name=slurm_test
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+
+# Loads modules
+module load miniconda3
+
+# configure conda
+#conda init
+#source ~/.bashrc
+eval "$(conda shell.bash hook)"
+
+# activate your conda env
+conda activate dgiles-data_access
+
+# Run your python code
+python /shared/users-local/dgiles/join/join-scratch/workflows/swe/create_amsr2_icechunk_store.py --start 2018-09-01 --end 2018-09-02

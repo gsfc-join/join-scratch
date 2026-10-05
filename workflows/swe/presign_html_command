@@ -1,0 +1,1 @@
+aws s3 presign s3://airborne-smce-prod-user-bucket/JOIN/results/swe/swe_2018-2019_season.tar.gz --expires-in 604800
