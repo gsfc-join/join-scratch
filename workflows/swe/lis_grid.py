@@ -13,6 +13,10 @@ log = logging.getLogger(__name__)
 
 LIS_RELPATH = "lis_input_NMP_1000m_missouri.nc"
 
+# Bump this whenever the AreaDefinition construction logic changes
+# (e.g. earth-model fixes, corner-offset fixes) so old cached pickles
+# are automatically invalidated instead of silently reused.
+_AREA_DEF_CACHE_VERSION = "v2-sphere-R6371200"
 
 def _open_lis_ds(path, fs=None) -> xr.Dataset:
     """Open a LIS NetCDF as an xarray Dataset, supporting S3 URIs via obstore.
@@ -77,8 +81,9 @@ def build_lis_area_definition(
     cache_dir: Path | str | None = "_data/weights",
     overwrite: bool = False,
 ) -> AreaDefinition:
+    
     """Construct a pyresample AreaDefinition for the LIS Lambert Conformal grid.
-
+    
     All parameters are read from the global attributes of the LIS input file:
       - MAP_PROJECTION: LAMBERT CONFORMAL
       - SOUTH_WEST_CORNER_LAT/LON (pixel centres)
@@ -102,7 +107,8 @@ def build_lis_area_definition(
     """
     cache_path: Path | None = None
     if cache_dir is not None:
-        key = hashlib.md5(str(path).encode()).hexdigest()[:12]
+        key_src = f"{path}|{_AREA_DEF_CACHE_VERSION}"
+        key = hashlib.md5(key_src.encode()).hexdigest()[:12]        
         cache_path = Path(cache_dir) / f"lis-area-def-{key}.pkl"
         if cache_path.exists() and not overwrite:
             log.info("Reusing cached LIS AreaDefinition from %s", cache_path)
@@ -131,7 +137,8 @@ def build_lis_area_definition(
             "lat_2": truelat2,
             "lon_0": standard_lon,
             "lat_0": (truelat1 + truelat2) / 2.0,
-            "datum": "WGS84",
+            # "datum": "WGS84",
+            "R": 6371200.0,
             "units": "m",
         }
     )
@@ -148,7 +155,8 @@ def build_lis_area_definition(
         "lis_lcc",
         "LIS Lambert Conformal 1 km",
         "lis_lcc",
-        crs.to_dict(),
+        # crs.to_dict(),
+        crs,
         nx,
         ny,
         (x_min, y_min, x_max, y_max),

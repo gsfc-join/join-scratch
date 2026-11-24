@@ -5,4 +5,6 @@ python plot_swe.py ./_data/swe_combined_20190104.nc
 python plot_swe.py ./_data/swe_combined_20190105.nc
 python plot_swe.py ./_data/swe_combined_20190106.nc
 python plot_swe.py ./_data/swe_combined_20190107.nc
-
+python plot_swe.py ./_data/swe_combined_20190108.nc
+python plot_swe.py ./_data/swe_combined_20190109.nc
+python plot_swe.py ./_data/swe_combined_20190110.nc
