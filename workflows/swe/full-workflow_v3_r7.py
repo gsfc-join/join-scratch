@@ -65,7 +65,7 @@ import cartopy.feature as cfeature
 from pathlib import Path
 
 import pandas as pd
-from pyresample.geometry import SwathDefinition 
+from pyresample.geometry import AreaDefinition, SwathDefinition
 from pyresample.kd_tree import resample_nearest
 
 import pyproj
@@ -902,6 +902,11 @@ def _regrid_viirs(
     transformer = pyproj.Transformer.from_crs(_SIN_CRS, "EPSG:4326", always_xy=True)
     target_shape = lis_area_obj.shape
     combined_snow = np.full(target_shape, np.nan, dtype=np.float32)
+    # Each LIS cell takes its value only from the tile it lies in. A tile's
+    # padding reaches pad_px into its neighbours, so without this, later tiles
+    # overwrite cells that belong to earlier ones.
+    lis_lon, lis_lat = lis_area_obj.get_lonlats()
+    cell_x, cell_y = transformer.transform(lis_lon, lis_lat, direction="INVERSE")
 
     try:
         sorted_tiles = sorted(domain_tiles)
@@ -996,7 +1001,10 @@ def _regrid_viirs(
                 rg_tile = regrid(da_tile, source_def, lis_area_obj, method=method)
 
                 tile_result = rg_tile.values
-                valid_mask = ~np.isnan(tile_result)
+                x_min, y_max = _viirs_tile_corner_xy(h, v)
+                in_tile = ((cell_x >= x_min) & (cell_x < x_min + _MODIS_SIN_TILE_SIZE_M)
+                           & (cell_y <= y_max) & (cell_y > y_max - _MODIS_SIN_TILE_SIZE_M))
+                valid_mask = ~np.isnan(tile_result) & in_tile
                 combined_snow[valid_mask] = tile_result[valid_mask]
 
                 del padded, da_tile, rg_tile, tile_result, valid_mask, source_def
