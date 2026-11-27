@@ -9,8 +9,8 @@ AMSR2_DIR=/product/Standard/GCOM-W/GCOM-W.AMSR2/L3.SND_10/2
 CEDA_DIR=s3://airborne-smce-prod-user-bucket/JOIN/CEDA/
 VIIRS_DIR=s3://airborne-smce-prod-user-bucket/JOIN/VIIRS/
 WEIGHTS_DIR=_data/weights/
-START_DATE=2019/01/07
-END_DATE=2019/01/10
+START_DATE=2019/01/01
+END_DATE=2019/01/01
 
 python3 full-workflow_v3_r7.py --start-date $START_DATE --end-date $END_DATE --lis-path $LIS_PATH --amsr2-dir $AMSR2_DIR --ceda-dir $CEDA_DIR --viirs-dir $VIIRS_DIR \
 			       	 --weights-dir $WEIGHTS_DIR 

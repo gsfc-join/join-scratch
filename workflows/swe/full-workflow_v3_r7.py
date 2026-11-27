@@ -128,6 +128,39 @@ CEDA_URL = "https://dap.ceda.ac.uk/"
 import boto3
 import os
 
+def _check_sliderule_availability(domain: str = "slideruleearth.io", verbose: bool = True) -> bool:
+    """
+    Pre-flight + actual initialization of the SlideRule client.
+
+    icesat2.init() (wrapping sliderule.init()) performs a version check
+    against the server and returns a bool indicating whether that check
+    succeeded, so this single call both validates connectivity AND
+    performs the one-time client initialization the workflow needs later
+    -- no separate init() call should be made elsewhere in the script.
+
+    rethrow=False (the default) means init() will not raise on failure;
+    it should just return False, which is what we rely on here. If a
+    truly unreachable server instead causes init() to hang rather than
+    fail fast, a socket timeout is applied as a safety net.
+    """
+    log.info(f"Checking SlideRule API server availability at {domain} (and initializing client)...")
+    import socket
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30)
+    try:
+        status = icesat2.init(domain, verbose=verbose, rethrow=False)
+    except Exception as e:
+        log.warning(f"SlideRule API server check raised an exception: {e}")
+        status = False
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+    if status:
+        log.info("SlideRule API server is reachable; client initialized.")
+    else:
+        log.warning("SlideRule API server version check failed -- server may be unavailable.")
+    return bool(status)
+
 def refresh_aws_credentials():
     """Fetches fresh credentials from the boto3 session and injects them into the environment."""
     log.info("Refreshing AWS credentials...")
@@ -236,7 +269,8 @@ def _regrid_amsr2(
       index 1 -> standard deviation of snow depth (same pass/product)
 
     Units: JAXA stores this product in cm (confirmed via the dataset's
-    own 'UNIT' attribute) and output is kept in cm -- NOT converted to mm.
+    own 'UNIT' attribute). Output is converted to mm (cm * 10) before
+    being returned.
     """
 
     log.info("AMSR2: Reading data via direct h5py over SFTP...")
@@ -341,26 +375,39 @@ def _regrid_amsr2(
                 )
 
                 attrs = h5f[snd_key].attrs
-                scale_factor = attrs.get('SCALE FACTOR', attrs.get('SCALE_FACTOR', 0.1))
-                fill_value = attrs.get('ERROR_VALUE', -9999)
+                scale_factor_raw = attrs.get('SCALE FACTOR', attrs.get('SCALE_FACTOR', 0.1))
+                fill_value_raw = attrs.get('ERROR_VALUE', -9999)
+
+                # These HDF5 attributes have a (1,) dataspace, so h5py returns a
+                # 1-element numpy array rather than a plain scalar. Coerce to
+                # Python float/scalar here so later f-string formatting
+                # (e.g. ":.3f") and arithmetic behave as expected everywhere.
+                scale_factor = float(np.ravel(scale_factor_raw)[0])
+                fill_value = float(np.ravel(fill_value_raw)[0])
+                
                 unit_attr = attrs.get('UNIT', b'cm')
                 unit_str = unit_attr[0].decode() if isinstance(unit_attr, np.ndarray) else str(unit_attr)
                 if unit_str.strip().lower() != "cm":
                     log.warning(
                         f"AMSR2: dataset UNIT attribute reports '{unit_str}', not 'cm' as "
-                        "expected. Output is still being labeled/returned as cm -- verify "
-                        "this file's units if that warning persists."
+                        "expected. Output is still being converted assuming the source "
+                        "units are cm (and returned as mm) -- verify this file's units "
+                        "if that warning persists."
                     )
 
-                def _scale_to_cm(layer):
+                def _scale_to_mm(layer):
                     layer_f = layer.astype(np.float32)
                     layer_f[layer == fill_value] = np.nan
                     layer_f[layer_f < 0] = np.nan
-                    return layer_f * scale_factor  # stays in cm -- NOT converted to mm
+                    return layer_f * scale_factor * 10.0  # cm -> mm
 
-                snow_depth_mean = _scale_to_cm(mean_layer)
-                snow_depth_std = _scale_to_cm(std_layer) if std_layer is not None else None
+                snow_depth_mean = _scale_to_mm(mean_layer)
+                snow_depth_std = _scale_to_mm(std_layer) if std_layer is not None else None
 
+                log.info(
+                    f"AMSR2: scale_factor={scale_factor} -> output mm = raw_DN * {scale_factor} * 10.0 "
+                    f"(= raw_DN * {scale_factor * 10.0:.3f})"
+                )
                 da_mean = xr.DataArray(
                     snow_depth_mean, coords={"lat": lat_data, "lon": lon_data}, dims=["lat", "lon"]
                 )
@@ -418,7 +465,7 @@ def _regrid_amsr2(
 
     rg_mean = rg["snow_depth_mean"].assign_coords(lat=lis_grid.lat, lon=lis_grid.lon)
     rg_mean.attrs["long_name"] = "AMSR2 snow depth mean (descending pass, daily, 0.1deg)"
-    rg_mean.attrs["units"] = "cm"
+    rg_mean.attrs["units"] = "mm"   # changed from "cm"
 
     result = {
         "amsr2_snow_depth_mean": xr.DataArray(
@@ -426,7 +473,7 @@ def _regrid_amsr2(
             dims=["north_south", "east_west"],
             attrs={
                 "long_name": "AMSR2 snow depth mean (descending pass, daily, 0.1deg)",
-                "units": "cm",
+                "units": "mm",   # changed from "cm"
                 "source": f"JAXA G-Portal SFTP: {input_dir}",
             },
         )
@@ -439,7 +486,7 @@ def _regrid_amsr2(
             dims=["north_south", "east_west"],
             attrs={
                 "long_name": "AMSR2 snow depth standard deviation (descending pass, daily, 0.1deg)",
-                "units": "cm",
+                "units": "mm",   # changed from "cm"
                 "source": f"JAXA G-Portal SFTP: {input_dir}",
             },
         )
@@ -1339,8 +1386,20 @@ def main() -> None:
     # Generate a list of daily dates
     dates = pd.date_range(start=ns.start_date, end=ns.end_date, freq='D')
 
-    # Initialize SlideRule connection
-    icesat2.init("slideruleearth.io", True)
+    # ---------------------------------------------------------
+    # Pre-flight check: is the SlideRule API server reachable?
+    # This also performs the one-time client initialization --
+    # do not call icesat2.init() again later in the script.
+    # ---------------------------------------------------------
+    icesat2_enabled = _check_sliderule_availability("slideruleearth.io", verbose=True)
+    if not icesat2_enabled:
+        print("\nWARNING: The SlideRule API server version check failed -- it does not appear to be reachable.")
+        print("ICESat-2 ATL06 snow-depth/height data cannot be fetched without it.")
+        answer = input("Continue running the workflow WITHOUT ICESat-2 data for all dates? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes"):
+            log.error("Aborting workflow at user request (SlideRule API unavailable).")
+            return
+        log.warning("Proceeding WITHOUT ICESat-2/SlideRule data for the entire date range.")
     
     # -------------------------------------------------------------------------
     # MAIN TIME LOOP
@@ -1374,8 +1433,8 @@ def main() -> None:
 
         # 1. Initialize Default Schema Dummies 
         if ns.amsr2_dir is not None:
-            data_vars["amsr2_snow_depth_mean"] = get_dummy("AMSR2 snow depth mean", "cm")
-            data_vars["amsr2_snow_depth_std"] = get_dummy("AMSR2 snow depth standard deviation", "cm")
+            data_vars["amsr2_snow_depth_mean"] = get_dummy("AMSR2 snow depth mean", "mm")
+            data_vars["amsr2_snow_depth_std"] = get_dummy("AMSR2 snow depth standard deviation", "mm")
             
         if ns.ceda_dir is not None:
             data_vars["ceda_swe"] = get_dummy("CEDA ESA CCI snow water equivalent", "mm")
@@ -1427,7 +1486,14 @@ def main() -> None:
         # VIRTUAL READ FROM SLIDERULE API (Replacing Parquet Read)
         # =========================================================
         try:
-            log.info(f"Fetching ICESat-2 data virtually from SlideRule API for {date_str}...")
+            if icesat2_enabled:
+                try:
+                    log.info(f"Fetching ICESat-2 data virtually from SlideRule API for {date_str}...")
+                    ...
+                except Exception as e:
+                    log.error(f"Failed to virtually fetch or process SlideRule data for {date_str}: {e}")
+            else:
+                log.info(f"Skipping ICESat-2/SlideRule fetch for {date_str} (server unavailable, user chose to continue).")
             
             # 1. Define LIS domain polygon dynamically from your LIS grid
             lat_min, lat_max = float(lis_grid.lat.min()), float(lis_grid.lat.max())
